@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>キー変更アプリ</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <h1>キー変更アプリ</h1>
+    <p class="lead">YouTube などの URL を貼り付けて、テンポはそのままでキー(音の高さ)だけを変えられます。</p>
+  </header>
+
+  <div id="env-warning" class="alert alert-error" hidden></div>
+
+  <section class="card" aria-labelledby="src-h">
+    <h2 id="src-h">1. 音源を読み込む</h2>
+    <form id="url-form" class="row" autocomplete="off">
+      <label for="url" class="sr-only">URL</label>
+      <input id="url" type="url" inputmode="url" placeholder="https://www.youtube.com/watch?v=..." required>
+      <button id="load-btn" type="submit" class="btn btn-primary">読み込み</button>
+    </form>
+    <p class="hint">YouTube などの動画サイトの URL、または mp3 などの音声ファイルの URL に対応しています。</p>
+
+    <div class="or"><span>または</span></div>
+
+    <label class="file-pick">
+      <input id="file" type="file" accept="audio/*,video/*,.mp3,.m4a,.wav,.flac,.ogg,.opus,.webm,.mp4">
+      <span class="btn">パソコン内の音声ファイルを選ぶ</span>
+      <span id="file-name" class="hint">選択されていません</span>
+    </label>
+
+    <div id="loading" class="status" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="status-body">
+        <div id="loading-text">読み込み中…</div>
+        <div class="bar" aria-hidden="true"><div id="bar-fill"></div></div>
+      </div>
+    </div>
+    <div id="error" class="alert alert-error" role="alert" hidden></div>
+  </section>
+
+  <section id="player-card" class="card" aria-labelledby="key-h" hidden>
+    <div class="track">
+      <div id="title" class="track-title"></div>
+      <div id="duration" class="track-meta"></div>
+    </div>
+
+    <h2 id="key-h">2. キーを変える</h2>
+    <div class="key-ctl">
+      <button id="minus" type="button" class="btn btn-round" aria-label="半音下げる">−</button>
+      <div class="key-val">
+        <output id="key-value" aria-live="polite">±0</output>
+        <span id="key-label" class="hint">原曲キー</span>
+      </div>
+      <button id="plus" type="button" class="btn btn-round" aria-label="半音上げる">+</button>
+    </div>
+    <input id="slider" type="range" min="-12" max="12" step="1" value="0" aria-label="キー(半音)">
+    <div class="ticks" aria-hidden="true"><span>-12</span><span>-6</span><span>0</span><span>+6</span><span>+12</span></div>
+    <div class="row-center"><button id="reset" type="button" class="btn btn-small">原曲キーに戻す</button></div>
+
+    <h2>3. 聴いてみる・保存する</h2>
+    <div id="rendering" class="status small" hidden>
+      <div class="spinner" aria-hidden="true"></div><div>変換中…(長い曲は少し時間がかかります)</div>
+    </div>
+    <audio id="player" controls preload="auto"></audio>
+    <a id="download" class="btn btn-primary btn-block" role="button" tabindex="-1" download aria-disabled="true">ダウンロード (MP3)</a>
+    <p id="engine-note" class="hint"></p>
+  </section>
+
+  <footer class="hint">このアプリはあなたのパソコンの中だけで動いています。著作権のある音源は個人的な練習の範囲でご利用ください。</footer>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

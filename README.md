@@ -1,0 +1,171 @@
+# キー変更アプリ
+
+YouTube などの動画サイトの URL(または音声ファイル)から音声を取り出し、
+**テンポ(速さ)はそのままで、キー(音の高さ)だけを半音単位で上げ下げ**できるアプリです。
+変えた音はブラウザでその場で聴けて、MP3 で保存できます。
+
+![画面の例](docs/screenshot.png)
+
+- 対応: YouTube などの動画・音声サイト(yt-dlp が対応しているサイト)、mp3 などの音声ファイルの URL、パソコン内の音声ファイル
+- キーの範囲: −12 〜 +12(半音単位。12 で 1 オクターブ)
+- 長さ 20 分まで、ファイルサイズ 200MB まで
+- このアプリは **あなたのパソコンの中だけ** で動きます(他の人からはアクセスできません)
+
+---
+
+## 準備(最初の 1 回だけ)
+
+必要なものは 3 つです。
+
+| 必要なもの | 用途 |
+|---|---|
+| Python(3.10 以上) | アプリ本体を動かす |
+| ffmpeg | 音声の変換 |
+| deno | YouTube の読み込みに必要(他のサイトだけなら無くても動きます) |
+
+### Windows の場合
+
+1. **スタートボタンを右クリック →「ターミナル」**(または「Windows PowerShell」)を開きます。
+2. 次の 3 行を 1 行ずつ貼り付けて Enter を押します。
+
+   ```
+   winget install --id Python.Python.3.12 -e
+   winget install --id Gyan.FFmpeg -e
+   winget install --id DenoLand.Deno -e
+   ```
+
+   途中で「同意しますか?」と聞かれたら `Y` を押して Enter。
+3. **ターミナルを一度閉じます**(インストールしたものを認識させるため)。
+
+> `winget` が使えない場合は、Python は https://www.python.org/downloads/ からインストールしてください。
+> インストール画面の最初で **「Add python.exe to PATH」に必ずチェック** を入れてください。
+
+### Mac の場合
+
+1. 「アプリケーション」→「ユーティリティ」→ **「ターミナル」** を開きます。
+2. Homebrew が入っていなければ、https://brew.sh/ja/ の「インストール」欄にある 1 行をターミナルに貼り付けて Enter(パスワードを聞かれたら Mac のログインパスワードを入力。入力中は何も表示されませんが正常です)。終わったら画面の「Next steps」の指示に従ってください。
+3. 次の 1 行を貼り付けて Enter。
+
+   ```
+   brew install python ffmpeg-full deno
+   ```
+
+   > `ffmpeg-full` は高音質なキー変更機能(rubberband)入りの ffmpeg です。
+   > 普通の `ffmpeg` でも動きますが、その場合は音質が少し落ちる「簡易モード」になります。
+   > `ffmpeg-full` は他のアプリと場所が別になることがありますが、このアプリは自動で見つけます。
+
+---
+
+## 起動のしかた
+
+このフォルダ(`key-changer`)をデスクトップなど分かりやすい場所に置いてください。
+
+### Windows
+
+**`start.bat` をダブルクリック** します。
+
+- 黒い画面が開き、初回は部品のインストールで数分かかります。
+- 準備ができると自動でブラウザに `http://127.0.0.1:8000` が開きます。
+- 「Windows によって PC が保護されました」と出たら「詳細情報」→「実行」を押してください。
+
+### Mac
+
+**`start.command` をダブルクリック** します。
+
+- 「開発元を検証できないため開けません」と出た場合は、`start.command` を **右クリック(control + クリック)→「開く」→「開く」** で起動できます。
+- 「アクセス権がありません」と出た場合は、ターミナルで次を実行してから再度ダブルクリックしてください
+  (`cd ` のあとにスペースを入れ、`key-changer` フォルダをターミナルにドラッグ&ドロップすると場所が入力されます)。
+
+  ```
+  cd (key-changer フォルダの場所)
+  chmod +x start.command start.sh update.command
+  ```
+
+### Linux
+
+```
+./start.sh
+```
+
+### 使い方
+
+1. YouTube などの URL を貼り付けて **「読み込み」**(またはパソコン内の音声ファイルを選ぶ)。
+2. スライダーか **− / +** ボタンでキーを変えます(少し待つと「変換中…」のあとに切り替わります)。
+3. 再生ボタンで確認し、**「ダウンロード」** で MP3 を保存します。ファイル名は「曲名 (+2).mp3」のようになります。
+
+### 終了のしかた
+
+黒い画面(ターミナル)で **Ctrl + C** を押すか、そのウィンドウを閉じます。
+ブラウザのタブを閉じただけではアプリは止まりません。
+
+---
+
+## うまくいかないとき
+
+### YouTube が読み込めなくなった(急に「ダウンロードに失敗しました」と出る)
+
+YouTube は仕様がよく変わるため、読み込みに使っている部品 **yt-dlp を最新版に更新** すると直ることが多いです。
+
+- Windows: **`update.bat` をダブルクリック**
+- Mac: **`update.command` をダブルクリック**
+- Linux: `./update.sh`
+
+更新後、アプリを起動し直してください。
+
+### 「JavaScript 実行環境 (deno) が見つからない」と出る
+
+最近の YouTube の読み込みには **deno** が必要です。「準備」の手順で deno をインストールし、
+黒い画面を閉じてからアプリを起動し直してください。
+
+- Windows: `winget install --id DenoLand.Deno -e`
+- Mac: `brew install deno`
+
+### 「ffmpeg が見つかりません」と出る
+
+「準備」の手順で ffmpeg をインストールし、**黒い画面を閉じてから** 起動し直してください。
+(Windows はパソコンの再起動が必要なこともあります。)
+
+### 「Python が見つかりません」と出る
+
+「準備」の手順で Python をインストールしてください。Windows で python.org からインストールした場合は
+「Add python.exe to PATH」にチェックを入れ直して再インストールしてください。
+
+### 音質について
+
+ffmpeg に「rubberband」という高音質な変換機能が入っていればそれを使います。
+無い場合は簡易方式で変換し、画面に「簡易モード」と表示されます(使えますが、音質が少し落ちることがあります)。
+
+「簡易モード」と表示されて高音質にしたい場合:
+
+- Windows: `winget install --id Gyan.FFmpeg -e`(full 版。essentials 版には入っていないことがあります)
+- Mac: `brew install ffmpeg-full`(Homebrew の普通の `ffmpeg` には入っていません)
+
+インストール後、黒い画面を閉じてアプリを起動し直してください。
+
+### 起動しない・セットアップが毎回失敗する
+
+初回セットアップを途中で止めた場合などに起こることがあります。
+**`key-changer` フォルダの中の `.venv` フォルダを削除してから**、もう一度起動してください
+(`.venv` は隠しフォルダです。Mac では Finder で `command + shift + .` を押すと表示されます)。
+Linux(Ubuntu など)で「仮想環境を作れませんでした」と出る場合は `sudo apt install python3-venv` を実行してください。
+
+### その他
+
+- ポート 8000 がほかのアプリで使われていると起動できません。その場合は環境変数 `KEYCHANGER_PORT` で変更できます。
+- ログインが必要な動画・非公開動画・ライブ配信・ネットラジオ・プレイリストには対応していません。
+- 著作権のある音源は、個人的な練習など法律で認められた範囲でご利用ください。
+
+---
+
+## 開発者向けメモ
+
+- 構成: `app.py`(FastAPI サーバー)、`audio.py`(ffmpeg による変換)、`static/`(画面)、`launcher.py`(venv 作成と起動)
+- キー変更: ffmpeg の `rubberband` フィルタ(`pitch=2^(n/12)`, `tempo=1`)。無い場合は `asetrate` + `aresample` + `atempo` で代替。0 のときは MP3 に変換するだけ。
+- キャッシュ: OS の一時フォルダの `key-changer-cache`(`KEYCHANGER_CACHE` で変更可)。起動時と読み込み時に、7 日より古いものと合計 2GB(`KEYCHANGER_CACHE_MB`)を超えた分を古い順に削除。
+- 設定(環境変数): `KEYCHANGER_HOST`(既定 127.0.0.1)、`KEYCHANGER_PORT`(8000)、`KEYCHANGER_MAX_MINUTES`(20)、`KEYCHANGER_MAX_MB`(200)、`KEYCHANGER_MAX_DOWNLOAD_MINUTES`(15、ダウンロードにかけてよい時間)、`KEYCHANGER_NO_RUBBERBAND=1`(簡易方式を強制)、`KEYCHANGER_FFMPEG`(ffmpeg の場所)、`KEYCHANGER_ALLOWED_HOSTS`(127.0.0.1 / localhost 以外の Host 名で開く場合にカンマ区切りで指定。DNS リバインディング対策で、それ以外の Host ヘッダーは拒否します)
+- テスト:
+
+  ```
+  .venv/bin/pip install -r requirements-dev.txt
+  .venv/bin/python -m pytest
+  ```
