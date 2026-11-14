@@ -1,3 +1,4 @@
+import threading
 import time
 
 import pytest
@@ -15,6 +16,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod.settings, "cache_dir", tmp_path / "cache")
     monkeypatch.setattr(appmod.settings, "max_duration", 20 * 60)
     monkeypatch.setattr(appmod.settings, "engine", None)
+    monkeypatch.setattr(appmod.settings, "prefetch", False)  # 先回り変換は専用のテストでだけ動かす
+    monkeypatch.setattr(appmod, "_last_key", {})
     with TestClient(appmod.app, base_url="http://127.0.0.1:8000") as c:
         yield c
 
@@ -300,8 +303,19 @@ def test_cleanup_keeps_in_progress_part_files(client, monkeypatch):
     old.write_bytes(b"x")
     t = time.time() - 2 * 3600
     os.utime(old, (t, t))
+    # 並列変換の作業フォルダ(名前が .part で終わる)も同じ扱い
+    fresh_dir = r / ("c" * 20 + "_+3.mp3.abc.part")
+    old_dir = r / ("d" * 20 + "_+3.mp3.abc.part")
+    for d in (fresh_dir, old_dir):
+        d.mkdir()
+        (d / "seg0.f32").write_bytes(b"x")
+    os.utime(old_dir, (t, t))
     appmod.cleanup_cache()
     assert fresh.exists() and not old.exists()
+    assert fresh_dir.exists() and not old_dir.exists()
+    # 起動時は、前回の途中で残った作業フォルダを新しくても消す(変換中のファイルは残す)
+    appmod.cleanup_cache(startup=True)
+    assert fresh.exists() and not fresh_dir.exists()
 
 
 def test_cleanup_continues_when_a_file_is_locked(client, monkeypatch, tone_dir):
@@ -350,3 +364,196 @@ def test_rejects_foreign_host_header(client, host):
 @pytest.mark.parametrize("host", ["127.0.0.1:8000", "localhost:8000", "localhost", "[::1]:8000"])
 def test_accepts_local_host_header(client, host):
     assert client.get("/api/status", headers={"Host": host}).status_code == 200
+
+
+# ---------------------------------------------------------------- 先回り変換・取り消し
+def upload_tone(client, tone_dir):
+    with open(tone_dir / "tone440.wav", "rb") as f:
+        r = client.post("/api/upload", files={"file": ("tone440.wav", f, "audio/wav")})
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def rendered_keys(sid):
+    return sorted(int(p.stem.split("_")[1]) for p in appmod.renders_dir().glob(f"{sid}_*.mp3"))
+
+
+def test_prefetch_renders_neighbouring_keys(client, tone_dir, monkeypatch):
+    monkeypatch.setattr(appmod.settings, "prefetch", True)
+    sid = upload_tone(client, tone_dir)
+    assert client.post("/api/render", json={"id": sid, "semitones": 2}).status_code == 200
+    assert appmod.prefetcher.wait_idle(60)
+    assert rendered_keys(sid) == [1, 2, 3]
+    # 先回りした分はそのまま使われ、さらにその先を用意する
+    assert client.post("/api/render", json={"id": sid, "semitones": 3}).status_code == 200
+    assert appmod.prefetcher.wait_idle(60)
+    assert rendered_keys(sid) == [1, 2, 3, 4]
+    # 下げていくときは、下のキーを先に用意する
+    appmod.prefetcher.stop()
+    seen = []
+    monkeypatch.setattr(appmod.prefetcher, "schedule", lambda source_id, keys: seen.append(keys))
+    appmod.render_path(sid, 1).unlink()
+    assert client.post("/api/render", json={"id": sid, "semitones": 2}).status_code == 200
+    assert seen == [[1]]                                  # +3 はもうある
+    appmod.render_path(sid, 3).unlink()
+    assert client.post("/api/render", json={"id": sid, "semitones": 2}).status_code == 200
+    assert seen[-1] == [3, 1]
+    appmod._last_key[sid] = 3
+    assert client.post("/api/render", json={"id": sid, "semitones": 2}).status_code == 200
+    assert seen[-1] == [1, 3]
+    out = decode(appmod.render_path(sid, 4))
+    assert dominant_freq(out) == pytest.approx(440 * 2 ** (4 / 12), rel=0.02)
+
+
+def test_prefetch_stays_in_range_and_can_be_disabled(client, tone_dir, monkeypatch):
+    sid = upload_tone(client, tone_dir)
+    assert client.post("/api/render", json={"id": sid, "semitones": 5}).status_code == 200
+    assert appmod.prefetcher.wait_idle(60)
+    assert rendered_keys(sid) == [5]                      # prefetch=False なら何もしない
+    monkeypatch.setattr(appmod.settings, "prefetch", True)
+    assert client.post("/api/render", json={"id": sid, "semitones": 12}).status_code == 200
+    assert appmod.prefetcher.wait_idle(60)
+    assert rendered_keys(sid) == [5, 11, 12]              # +13 は作らない
+
+
+class FakeRender:
+    """audio.render の代わり。release されるまで終わらず、その間に cancel されたら RenderCancelled。"""
+
+    def __init__(self, blocking=None):
+        self.blocking = blocking  # 止めておくキー(None = すべて)
+        self.started = {}   # semitones -> Event
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+
+    def wait_started(self, semitones, timeout=10):
+        with self.lock:
+            ev = self.started.setdefault(semitones, threading.Event())
+        assert ev.wait(timeout), f"render {semitones} did not start"
+
+    def __call__(self, src, dst, semitones, engine=None, jobs=None, cancel=None):
+        with self.lock:
+            self.started.setdefault(semitones, threading.Event()).set()
+        while not self.release.is_set() and (self.blocking is None or semitones in self.blocking):
+            if cancel.wait(0.01):
+                raise audio.RenderCancelled()
+        dst.write_bytes(b"mp3")
+        return "fake"
+
+
+def run_async(fn, *a, **kw):
+    box = {}
+
+    def target():
+        try:
+            box["result"] = fn(*a, **kw)
+        except BaseException as e:  # noqa: BLE001
+            box["error"] = e
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    box["thread"] = t
+    return box
+
+
+def finish(box, timeout=10):
+    box["thread"].join(timeout)
+    assert not box["thread"].is_alive()
+    return box
+
+
+@pytest.fixture()
+def fake_render(client, tone_dir, monkeypatch):
+    fake = FakeRender()
+    sid = upload_tone(client, tone_dir)
+    monkeypatch.setattr(appmod.audio, "render", fake)
+    yield fake, sid
+    fake.release.set()
+
+
+def test_background_render_yields_to_foreground(fake_render):
+    fake, sid = fake_render
+    bg = run_async(appmod.ensure_render, sid, 5, background=True)
+    fake.wait_started(5)
+    fg = run_async(appmod.ensure_render, sid, 6)
+    # 利用者の変換が来たら、先回り変換は取り消される
+    assert isinstance(finish(bg).get("error"), audio.RenderCancelled)
+    fake.wait_started(6)
+    # 利用者の変換が動いている間は、先回り変換を始めない
+    late = run_async(appmod.ensure_render, sid, 7, background=True)
+    assert isinstance(finish(late, 2).get("error"), audio.RenderCancelled)
+    fake.release.set()
+    assert finish(fg)["result"] == appmod.render_path(sid, 6)
+    assert not appmod.render_path(sid, 5).exists()
+    assert appmod._renders == [] and appmod._foreground == 0
+
+
+def test_foreground_waits_for_background_render_of_same_key(fake_render):
+    fake, sid = fake_render
+    bg = run_async(appmod.ensure_render, sid, 5, background=True)
+    fake.wait_started(5)
+    fg = run_async(appmod.ensure_render, sid, 5)
+    time.sleep(0.2)
+    assert "error" not in bg and bg["thread"].is_alive()   # 同じキーなら取り消さずに待つ
+    fake.release.set()
+    assert finish(bg)["result"] == finish(fg)["result"] == appmod.render_path(sid, 5)
+
+
+def test_newer_key_supersedes_running_render(fake_render):
+    fake, sid = fake_render
+    first = run_async(appmod.ensure_render, sid, 1, supersede=True)
+    fake.wait_started(1)
+    other = run_async(appmod.ensure_render, sid, 3)        # 再生・ダウンロード側(supersede なし)
+    fake.wait_started(3)
+    time.sleep(0.1)
+    assert first["thread"].is_alive()                      # supersede なしでは取り消さない
+    second = run_async(appmod.ensure_render, sid, 2, supersede=True)
+    assert isinstance(finish(first).get("error"), audio.RenderCancelled)
+    assert isinstance(finish(other).get("error"), audio.RenderCancelled)
+    fake.wait_started(2)
+    fake.release.set()
+    assert finish(second)["result"] == appmod.render_path(sid, 2)
+    assert appmod._renders == [] and appmod._foreground == 0
+
+
+def test_superseded_render_returns_409(client, tone_dir, monkeypatch):
+    sid = upload_tone(client, tone_dir)
+
+    def cancelled(*a, **kw):
+        raise audio.RenderCancelled()
+    monkeypatch.setattr(appmod.audio, "render", cancelled)
+    r = client.post("/api/render", json={"id": sid, "semitones": 4})
+    assert r.status_code == 409 and r.json()["detail"]
+    assert appmod._renders == [] and appmod._foreground == 0
+
+
+@pytest.fixture()
+def fake_prefetch(client, tone_dir, monkeypatch):
+    """先回り変換を有効にし、+1 への変換だけ release されるまで終わらないようにする。"""
+    monkeypatch.setattr(appmod.settings, "prefetch", True)
+    sid = upload_tone(client, tone_dir)
+    fake = FakeRender(blocking={1})
+    monkeypatch.setattr(appmod.audio, "render", fake)
+    yield fake, sid
+    fake.release.set()
+    appmod.prefetcher.wait_idle(10)
+
+
+def test_prefetch_is_replaced_when_the_key_moves_on(client, fake_prefetch):
+    fake, sid = fake_prefetch
+    assert client.post("/api/render", json={"id": sid, "semitones": 0}).status_code == 200
+    fake.wait_started(1)                                   # +1 を先回り中(まだ終わらない)
+    assert client.post("/api/render", json={"id": sid, "semitones": 5}).status_code == 200
+    assert appmod.prefetcher.wait_idle(10)
+    # +1 と -1 の先回りはやめて、新しいキーの隣(+6, +4)を用意する
+    assert rendered_keys(sid) == [0, 4, 5, 6]
+
+
+def test_prefetch_resumes_after_yielding(client, fake_prefetch):
+    fake, sid = fake_prefetch
+    assert client.post("/api/render", json={"id": sid, "semitones": 0}).status_code == 200
+    fake.wait_started(1)
+    fake.started.clear()
+    appmod.ensure_render(sid, 7)                           # 利用者の変換(再生・ダウンロード)が割り込む
+    fake.wait_started(1)                                   # 譲ったあと、+1 の先回りをやり直す
+    fake.release.set()
+    assert appmod.prefetcher.wait_idle(10)
+    assert rendered_keys(sid) == [-1, 0, 1, 7]

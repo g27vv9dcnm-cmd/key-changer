@@ -25,6 +25,18 @@ def make_tone(path: Path, freq=440, duration=5.0, rate=44100):
     return path
 
 
+def make_song(path: Path, duration=14.0):
+    """並列変換のテスト用: 音程のある音 + 一定間隔で鳴る雑音(打楽器の代わり)。"""
+    subprocess.run(
+        [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"sine=frequency=330:duration={duration}:sample_rate=44100",
+         "-f", "lavfi", "-i", f"anoisesrc=duration={duration}:color=pink:amplitude=0.3:seed=7,"
+                              "tremolo=f=2:d=0.95",
+         "-filter_complex", "[0][1]amix=inputs=2:normalize=0", "-ac", "2", str(path)],
+        check=True)
+    return path
+
+
 def decode(path: Path, rate=44100) -> np.ndarray:
     out = subprocess.run(
         [FFMPEG, "-hide_banner", "-loglevel", "error", "-i", str(path),
@@ -49,6 +61,7 @@ def tone_dir(tmp_path_factory):
     d = tmp_path_factory.mktemp("tones")
     make_tone(d / "tone440.wav")
     make_tone(d / "tone440.mp3")
+    make_song(d / "song.wav")
     (d / "notaudio.mp3").write_bytes(b"this is not audio" * 100)
     return d
 

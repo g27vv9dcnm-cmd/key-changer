@@ -18,6 +18,7 @@ import uuid
 import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
@@ -45,6 +46,9 @@ class Settings:
     max_download_seconds: float = float(os.environ.get("KEYCHANGER_MAX_DOWNLOAD_MINUTES", "15")) * 60
     part_max_age: float = 3600  # これより古い作業中ファイル(.part)は消す(変換のタイムアウトは 900 秒)
     engine: str | None = None  # None = 自動(rubberband があれば使う)
+    jobs: int | None = None    # 並列変換に使うプロセス数。None = 自動(CPU のコア数)、1 = 並列にしない
+    # 聴いているキーの隣(±1)を先回りして変換しておく
+    prefetch: bool = os.environ.get("KEYCHANGER_PREFETCH", "1") != "0"
 
 
 settings = Settings()
@@ -113,8 +117,11 @@ def _touch(p: Path) -> None:
         pass
 
 
-def cleanup_cache() -> None:
-    """古いファイルを消し、合計サイズが上限を超えていれば古い順に消す。"""
+def cleanup_cache(startup: bool = False) -> None:
+    """古いファイルを消し、合計サイズが上限を超えていれば古い順に消す。
+
+    startup=True(起動時)は、前回の起動で途中になった並列変換の作業フォルダも消す。
+    """
     root = settings.cache_dir
     root.mkdir(parents=True, exist_ok=True)
     sources_dir().mkdir(exist_ok=True)
@@ -145,8 +152,9 @@ def cleanup_cache() -> None:
         except OSError:
             continue
         if f.name.endswith(".part"):
-            # 変換中の一時ファイル。変換中のものは消さず、古い残骸だけ消す
-            if now - st.st_mtime > settings.part_max_age:
+            # 変換中の一時ファイル・作業フォルダ。変換中のものは消さず、古い残骸だけ消す。
+            # 作業フォルダは大きい(数百 MB)ので、起動時はすぐ消す(前回の途中のものしか無いはず)
+            if now - st.st_mtime > settings.part_max_age or (startup and f.is_dir()):
                 remove_path(f)
             continue
         entries.append((st.st_mtime, st.st_size, f))
@@ -383,12 +391,33 @@ def save_upload(upload: UploadFile) -> dict:
 
 
 # ---------------------------------------------------------------- 変換
+@dataclass(eq=False)
+class _Render:
+    """実行中(または順番待ち)の変換 1 件。"""
+    source_id: str
+    semitones: int
+    background: bool  # True = 先回り変換
+    cancel: threading.Event = field(default_factory=threading.Event)
+
+
 _render_locks: dict[str, threading.Lock] = {}
-_render_locks_guard = threading.Lock()
+_render_guard = threading.Condition()  # _render_locks / _renders / _foreground を守る
+_renders: list[_Render] = []
+_foreground = 0  # 利用者が待っている変換の数。1 つでもあれば先回り変換は動かさない
 _render_sem = threading.Semaphore(2)  # 同時変換数の上限
 
 
-def ensure_render(source_id: str, semitones: int) -> Path:
+def ensure_render(source_id: str, semitones: int, *, background: bool = False,
+                  supersede: bool = False,
+                  wanted: Callable[[], bool] | None = None) -> Path:
+    """キーを変えた MP3 を(無ければ変換して)用意し、そのパスを返す。
+
+    background=True は先回り変換。利用者が待っている変換があるときは始めず、
+    途中で利用者の変換が来たら取り消される(どちらも audio.RenderCancelled)。
+    wanted は「この先回り変換がまだ必要か」を返す関数で、不要になっていたら始めない。
+    supersede=True は「この音源の、ほかのキーへの変換はもう要らない」という意味で、
+    実行中のものを取り消す(スライダーを動かして別のキーに変えたとき)。
+    """
     check_id(source_id)
     try:
         audio.validate_semitones(semitones)
@@ -398,22 +427,155 @@ def ensure_render(source_id: str, semitones: int) -> Path:
     if not src:
         raise UserError("音声が見つかりません(キャッシュが削除された可能性があります)。もう一度読み込んでください。", 404)
     out = render_path(source_id, semitones)
-    key = out.name
-    with _render_locks_guard:
-        lock = _render_locks.setdefault(key, threading.Lock())
-    with lock:
-        if out.exists():
-            _touch(out)
-            return out
-        if not audio.find_ffmpeg():
-            raise UserError(MSG_FFMPEG, 500)
-        with _render_sem:
+    if out.exists():
+        _touch(out)
+        return out
+    me = _Render(source_id, semitones, background)
+    global _foreground
+    with _render_guard:
+        if background:
+            if _foreground or (wanted is not None and not wanted()):
+                raise audio.RenderCancelled()
+        else:
+            _foreground += 1
+            for r in _renders:
+                same = r.source_id == source_id and r.semitones == semitones
+                if not same and (r.background or (supersede and r.source_id == source_id)):
+                    r.cancel.set()
+        _renders.append(me)
+        lock = _render_locks.setdefault(out.name, threading.Lock())
+    try:
+        with lock:
+            if out.exists():
+                _touch(out)
+                return out
+            if not audio.find_ffmpeg():
+                raise UserError(MSG_FFMPEG, 500)
+            if background:
+                _render_to(src, out, me)
+            else:
+                with _render_sem:
+                    _render_to(src, out, me)
+            _touch(src.parent / "meta.json")
+        return out
+    finally:
+        with _render_guard:
+            _renders.remove(me)
+            if not background:
+                _foreground -= 1
+            _render_guard.notify_all()
+
+
+def _render_to(src: Path, out: Path, me: _Render) -> None:
+    if me.cancel.is_set():
+        raise audio.RenderCancelled()
+    try:
+        audio.render(src, out, me.semitones, engine=settings.engine, jobs=settings.jobs,
+                     cancel=me.cancel)
+    except audio.AudioError:
+        raise UserError("音声の変換に失敗しました。別の音源でお試しください。", 500) from None
+
+
+def cancel_all_renders() -> None:
+    with _render_guard:
+        for r in _renders:
+            r.cancel.set()
+
+
+class Prefetcher:
+    """聴いているキーの隣のキーを、空いている時間に先回りして変換しておく。
+
+    +/− を 1 つずつ動かしたときに待たずに済むようにするためのもの。
+    利用者が待っている変換が始まったら譲り(取り消され)、終わってから続きをやる。
+    """
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._targets: list[tuple[str, int]] = []
+        self._thread: threading.Thread | None = None
+        self._busy = False
+        self._stopping = False
+
+    def schedule(self, source_id: str, keys: list[int]) -> None:
+        """先回りする対象を入れ替える(前に頼まれて、まだやっていない分は捨てる)。"""
+        targets = [(source_id, k) for k in keys]
+        with self._cv:
+            self._targets = targets
+            self._stopping = False
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="prefetch", daemon=True)
+                self._thread.start()
+            self._cv.notify_all()
+        with _render_guard:
+            for r in _renders:
+                if r.background and (r.source_id, r.semitones) not in targets:
+                    r.cancel.set()
+
+    def stop(self) -> None:
+        with self._cv:
+            self._targets = []
+            self._stopping = True
+            self._cv.notify_all()
+        with _render_guard:
+            for r in _renders:
+                if r.background:
+                    r.cancel.set()
+            _render_guard.notify_all()
+
+    def wait_idle(self, timeout: float = 60) -> bool:
+        """先回り変換がすべて終わるまで待つ(テスト用)。"""
+        with self._cv:
+            return self._cv.wait_for(lambda: not self._targets and not self._busy, timeout)
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._targets and not self._stopping:
+                    self._busy = False
+                    self._cv.notify_all()
+                    self._cv.wait()
+                if self._stopping:
+                    self._busy = False
+                    self._cv.notify_all()
+                    return
+                target = self._targets[0]
+                self._busy = True
+            with _render_guard:  # 利用者の変換が終わるまで待つ
+                while _foreground and not self._stopping:
+                    _render_guard.wait(1.0)
+            keep = False
             try:
-                audio.render(src, out, semitones, engine=settings.engine)
-            except audio.AudioError:
-                raise UserError("音声の変換に失敗しました。別の音源でお試しください。", 500) from None
-        _touch(src.parent / "meta.json")
-    return out
+                # 対象が入れ替わっていたら始めない(schedule と行き違いにならないよう、
+                # 変換の登録と同時に確かめる)
+                ensure_render(*target, background=True,
+                              wanted=lambda: not self._stopping and target in self._targets)
+            except audio.RenderCancelled:
+                keep = True  # 譲っただけ。対象に残っていれば後でやり直す
+            except Exception:  # noqa: BLE001  (先回りの失敗は利用者には見せない)
+                pass
+            if not keep:
+                with self._cv:
+                    if target in self._targets:
+                        self._targets.remove(target)
+
+
+prefetcher = Prefetcher()
+_last_key: dict[str, int] = {}  # 音源ごとの、直前に聴いていたキー(動かしている向きを知るため)
+
+
+def schedule_prefetch(source_id: str, semitones: int) -> None:
+    """いま聴いているキーの隣(動かしている向きを先に)を先回り変換の対象にする。"""
+    if not settings.prefetch:
+        return
+    prev = _last_key.get(source_id)
+    if len(_last_key) > 64:
+        _last_key.clear()
+    _last_key[source_id] = semitones
+    step = -1 if prev is not None and semitones < prev else 1
+    keys = [k for k in (semitones + step, semitones - step)
+            if audio.MIN_SEMITONES <= k <= audio.MAX_SEMITONES
+            and not render_path(source_id, k).exists()]
+    prefetcher.schedule(source_id, keys)
 
 
 def safe_filename(title: str, semitones: int) -> str:
@@ -477,10 +639,15 @@ def start_job(url: str) -> Job:
 @asynccontextmanager
 async def _lifespan(_app):
     try:
-        cleanup_cache()
+        cleanup_cache(startup=True)
     except OSError:
         pass
     yield
+    # 終了時: 動いている変換(ffmpeg)を止め、作業ファイルを片付け終わるのを少し待つ
+    prefetcher.stop()
+    cancel_all_renders()
+    with _render_guard:
+        _render_guard.wait_for(lambda: not _renders, timeout=5)
 
 
 app = FastAPI(title="キー変更アプリ", docs_url=None, redoc_url=None, lifespan=_lifespan)
@@ -510,6 +677,12 @@ async def _check_host(request, call_next):
 @app.exception_handler(UserError)
 async def _user_error(_, exc: UserError):
     return JSONResponse({"detail": exc.message}, status_code=exc.status)
+
+
+@app.exception_handler(audio.RenderCancelled)
+async def _render_cancelled(_, exc: audio.RenderCancelled):
+    # 別のキーに変えられて不要になった変換。画面側は新しい方の結果だけを使う
+    return JSONResponse({"detail": "変換を取り消しました。"}, status_code=409)
 
 
 class LoadRequest(BaseModel):
@@ -569,7 +742,8 @@ def _audio_url(source_id: str, semitones: int, download: bool = False) -> str:
 @app.post("/api/render")
 def api_render(req: RenderRequest):
     check_id(req.id)
-    ensure_render(req.id, req.semitones)
+    ensure_render(req.id, req.semitones, supersede=True)
+    schedule_prefetch(req.id, req.semitones)
     meta = read_meta(req.id) or {}
     return {"url": _audio_url(req.id, req.semitones),
             "download_url": _audio_url(req.id, req.semitones, True),
