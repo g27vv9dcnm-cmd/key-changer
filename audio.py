@@ -27,7 +27,14 @@ from pathlib import Path
 MIN_SEMITONES = -12
 MAX_SEMITONES = 12
 WORK_RATE = 44100  # 処理用のサンプルレート
-MP3_BITRATE = "192k"
+MP3_BITRATE = "320k"  # MP3 の最高ビットレート(劣化が一番少ない)
+
+# rubberband の設定(音質重視。速さはほとんど変わらない)
+#   pitchq=quality     : 音程を変えるときの計算を高品質にする
+#   formant=preserved  : 声の響き(フォルマント)を保つ。キーを上げても甲高い声、下げてもこもった声にならない
+#   channels=together  : 左右をまとめて処理し、音の広がり(定位)が崩れないようにする
+RUBBERBAND_OPTS = "tempo=1:pitchq=quality:formant=preserved:channels=together"
+RENDER_VERSION = "q2"  # 変換結果の音質が変わったら上げる(キャッシュのファイル名に入る)
 
 
 HOMEBREW_FFMPEG_FULL = (
@@ -89,6 +96,39 @@ def has_rubberband(ffmpeg: str | None = None) -> bool:
     return re.search(r"^\s*\S+\s+rubberband\s", _filters_of(ffmpeg), re.M) is not None
 
 
+@functools.lru_cache(maxsize=8)
+def _version_of(ffmpeg: str) -> str:
+    try:
+        out = subprocess.run(
+            [ffmpeg, "-hide_banner", "-version"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        return out.stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def has_soxr(ffmpeg: str | None = None) -> bool:
+    """ffmpeg に高音質なサンプルレート変換(soxr)が組み込まれているか。"""
+    if os.environ.get("KEYCHANGER_NO_SOXR") == "1":
+        return False
+    ffmpeg = ffmpeg or find_ffmpeg()
+    if not ffmpeg:
+        return False
+    return "--enable-libsoxr" in _version_of(ffmpeg)
+
+
+def resample_filter(ffmpeg: str | None = None) -> str:
+    """処理用のサンプルレートにそろえるフィルタ。soxr があれば高音質な方式を使う。"""
+    if has_soxr(ffmpeg):
+        return f"aresample={WORK_RATE}:resampler=soxr:precision=28"
+    return f"aresample={WORK_RATE}"
+
+
+def rubberband_filter(semitones: int) -> str:
+    return f"rubberband=pitch={pitch_ratio(semitones):.10f}:{RUBBERBAND_OPTS}"
+
+
 def validate_semitones(n: int) -> int:
     if not isinstance(n, int) or isinstance(n, bool):
         raise ValueError("semitones must be int")
@@ -114,18 +154,19 @@ def _atempo_chain(factor: float) -> list[str]:
     return parts
 
 
-def build_filter(semitones: int, engine: str) -> str:
+def build_filter(semitones: int, engine: str, ffmpeg: str | None = None) -> str:
     """-af に渡すフィルタ文字列を作る。engine は "rubberband" か "fallback"。"""
     validate_semitones(semitones)
-    chain = [f"aresample={WORK_RATE}"]
+    resample = resample_filter(ffmpeg)
+    chain = [resample]
     if semitones != 0:
         ratio = pitch_ratio(semitones)
         if engine == "rubberband":
-            chain.append(f"rubberband=pitch={ratio:.10f}:tempo=1:pitchq=quality")
+            chain.append(rubberband_filter(semitones))
         elif engine == "fallback":
             # 再生速度を変えて音程を上げ下げし、atempo で長さを元に戻す
             chain.append(f"asetrate={WORK_RATE * ratio:.4f}")
-            chain.append(f"aresample={WORK_RATE}")
+            chain.append(resample)
             chain.extend(_atempo_chain(1.0 / ratio))
         else:
             raise ValueError(f"unknown engine: {engine}")
@@ -192,7 +233,7 @@ def render(src: Path, dst: Path, semitones: int, engine: str | None = None,
     """
     ffmpeg = require_ffmpeg()
     engine = engine or choose_engine(ffmpeg)
-    build_filter(semitones, engine)  # 引数の検証
+    build_filter(semitones, engine, ffmpeg)  # 引数の検証
     dst.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
     jobs = default_jobs() if jobs is None else max(1, int(jobs))
@@ -216,7 +257,7 @@ def _render_single(ffmpeg: str, src: Path, dst: Path, semitones: int, engine: st
         ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
         "-i", str(src),
         "-vn", "-sn", "-dn",
-        "-af", build_filter(semitones, engine),
+        "-af", build_filter(semitones, engine, ffmpeg),
         *_encode_args(), str(tmp),
     ]
     try:
@@ -403,7 +444,7 @@ def _render_parallel(ffmpeg: str, src: Path, dst: Path, semitones: int, jobs: in
     fb = 4 * channels  # 1 フレームのバイト数
     base = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y"]
     raw = ["-f", "f32le", "-ar", str(WORK_RATE), "-ac", str(channels)]
-    af = f"rubberband=pitch={pitch_ratio(semitones):.10f}:tempo=1:pitchq=quality"
+    af = rubberband_filter(semitones)
     work = Path(tempfile.mkdtemp(prefix=dst.name + ".", suffix=".part", dir=dst.parent))
     pcm = work / "source.f32"
     tmp = work / "out.mp3"
@@ -450,7 +491,7 @@ def _render_parallel(ffmpeg: str, src: Path, dst: Path, semitones: int, jobs: in
         err_file = tempfile.TemporaryFile()
         try:
             dec = subprocess.Popen(
-                [*base, "-i", str(src), "-vn", "-sn", "-dn", "-af", f"aresample={WORK_RATE}",
+                [*base, "-i", str(src), "-vn", "-sn", "-dn", "-af", resample_filter(ffmpeg),
                  *raw, str(pcm)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err_file)
             procs.append(dec)

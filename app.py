@@ -109,7 +109,9 @@ def write_meta(source_id: str, meta: dict) -> None:
 def render_path(source_id: str, semitones: int) -> Path:
     check_id(source_id)
     audio.validate_semitones(semitones)
-    return renders_dir() / f"{source_id}_{semitones:+d}.mp3"
+    # 音質の設定を変えたら audio.RENDER_VERSION を上げる。名前が変わるので、古い設定で
+    # 変換したファイルは使われなくなり、そのうちキャッシュの掃除で消える
+    return renders_dir() / f"{source_id}_{semitones:+d}_{audio.RENDER_VERSION}.mp3"
 
 
 def _touch(p: Path) -> None:

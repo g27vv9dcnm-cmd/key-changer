@@ -43,10 +43,37 @@ def test_pitch_shift_keeps_tempo(tmp_path, tone_dir, engine, semitones):
 
 
 def test_build_filter_shapes():
-    assert audio.build_filter(0, "rubberband") == "aresample=44100"
+    assert audio.build_filter(0, "rubberband").startswith("aresample=44100")
+    assert "rubberband" not in audio.build_filter(0, "rubberband")
     assert "rubberband=pitch=2.0000000000" in audio.build_filter(12, "rubberband")
     f = audio.build_filter(-12, "fallback")
     assert "asetrate=22050.0000" in f and "atempo=2.0" in f and "rubberband" not in f
+
+
+def test_rubberband_uses_quality_options():
+    # 声の響きを保つ・左右をまとめて処理する・高品質な計算(音質のための設定)
+    f = audio.build_filter(5, "rubberband")
+    for opt in ("tempo=1", "pitchq=quality", "formant=preserved", "channels=together"):
+        assert opt in f
+    assert audio.rubberband_filter(5) in f
+
+
+def test_resample_uses_soxr_when_available(monkeypatch):
+    monkeypatch.setattr(audio, "has_soxr", lambda ffmpeg=None: True)
+    assert audio.resample_filter() == "aresample=44100:resampler=soxr:precision=28"
+    assert audio.build_filter(-12, "fallback").count("resampler=soxr") == 2
+    monkeypatch.setattr(audio, "has_soxr", lambda ffmpeg=None: False)
+    assert audio.resample_filter() == "aresample=44100"
+    assert "soxr" not in audio.build_filter(3, "rubberband")
+
+
+def test_disable_soxr_env(monkeypatch):
+    monkeypatch.setenv("KEYCHANGER_NO_SOXR", "1")
+    assert audio.has_soxr() is False
+
+
+def test_mp3_is_320k():
+    assert audio._encode_args()[audio._encode_args().index("-b:a") + 1] == "320k"
 
 
 @pytest.mark.parametrize("bad", [13, -13, 100, 1.5, "3", True])
