@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import argparse
 from contextlib import asynccontextmanager
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
+import socket
 import tempfile
 import threading
 import time
@@ -669,7 +671,7 @@ def _host_of(header: str) -> str:
 async def _check_host(request, call_next):
     host = _host_of(request.headers.get("host", ""))
     if "*" not in ALLOWED_HOSTS and host not in ALLOWED_HOSTS:
-        return JSONResponse({"detail": "このアドレスからは利用できません。http://127.0.0.1:8000 を開いてください。"},
+        return JSONResponse({"detail": f"このアドレスからは利用できません。{_app_url} を開いてください。"},
                             status_code=400)
     return await call_next(request)
 
@@ -771,31 +773,121 @@ app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 
 # ---------------------------------------------------------------- 起動
-def main() -> None:
+DEFAULT_PORT = 8000
+PORT_TRIES = 20      # 既定のポートが使用中のとき、続きの番号をいくつまで試すか(8000 なら 8019 まで)
+BROWSER_DELAY = 1.5  # 起動してからブラウザを開くまでの秒数
+_app_url = f"http://127.0.0.1:{DEFAULT_PORT}"  # 案内に出すアドレス。main() が実際の番号に直す
+
+# 「このポートは使えない」を表すエラー番号。Windows は予約済み・占有中のポートをアクセス拒否で断ることがある
+_PORT_BUSY = (errno.EADDRINUSE, errno.EACCES)
+
+
+class PortInUse(Exception):
+    def __init__(self, port: int):
+        super().__init__(f"port {port} is in use")
+        self.port = port
+
+
+def _bind(host: str, port: int) -> socket.socket:
+    """host:port で待ち受けを始めたソケットを返す。使えなければ OSError。"""
+    family, kind, proto, _, addr = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)[0]
+    sock = socket.socket(family, kind, proto)
+    try:
+        if os.name != "nt":
+            # 終了直後でもすぐ起動し直せるようにする。Windows でこれを付けると、
+            # 使用中のポートまで開けてしまう(別のアプリと混線する)ので付けない
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(addr)
+        sock.listen()
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+def open_server_socket(host: str, port: int, *, fallback: bool) -> socket.socket:
+    """待ち受け用のソケットを開く。
+
+    port が使用中のとき、fallback=True なら続きの番号を順に試し、それも全部だめなら OS に
+    空き番号を選ばせる。fallback=False なら(利用者が番号を指定したとき)PortInUse にする。
+    空きを調べてから開くのではなく、開けたソケットをそのままサーバーに渡すので、
+    調べたあとで他のアプリに取られることがない。
+    """
+    candidates = [port]
+    if fallback and port:
+        candidates += list(range(port + 1, min(port + PORT_TRIES, 65536))) + [0]
+    for candidate in candidates:
+        try:
+            return _bind(host, candidate)
+        except OSError as e:
+            if e.errno not in _PORT_BUSY:
+                raise
+    raise PortInUse(port)
+
+
+def main(argv: list[str] | None = None) -> None:
     import uvicorn
 
+    env_port = os.environ.get("KEYCHANGER_PORT", "").strip()
+    if env_port and not env_port.isdigit():
+        print(f"[エラー] 環境変数 KEYCHANGER_PORT は数字で指定してください(今の値: {env_port})。")
+        raise SystemExit(1)
     ap = argparse.ArgumentParser(description="キー変更アプリ")
     ap.add_argument("--host", default=os.environ.get("KEYCHANGER_HOST", "127.0.0.1"))
-    ap.add_argument("--port", type=int, default=int(os.environ.get("KEYCHANGER_PORT", "8000")))
+    ap.add_argument("--port", type=int, default=int(env_port) if env_port else None,
+                    help=f"待ち受けるポート番号。省略すると {DEFAULT_PORT}(使用中なら空いている番号)")
     ap.add_argument("--open", action="store_true", help="起動後にブラウザを開く")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+
+    # 番号を指定されたときはその番号だけを使う。指定がなければ、使用中のとき空いている番号へ移る
+    chosen = args.port is not None
+    wanted = args.port if chosen else DEFAULT_PORT
+    if not 0 <= wanted <= 65535:
+        print(f"[エラー] ポート番号は 0 から 65535 の間で指定してください(今の値: {wanted})。")
+        raise SystemExit(1)
+    try:
+        sock = open_server_socket(args.host, wanted, fallback=not chosen)
+    except PortInUse:
+        print(f"[エラー] ポート {wanted} はほかのアプリが使用中のため、起動できません。")
+        if chosen:
+            print("        ポート番号の指定(KEYCHANGER_PORT または --port)をやめると、"
+                  "空いている番号を自動で選びます。")
+        raise SystemExit(1) from None
+    except OSError as e:
+        print(f"[エラー] {args.host} のポート {wanted} で待ち受けを始められません: {e}")
+        raise SystemExit(1) from None
+    port = sock.getsockname()[1]
 
     if args.host not in ("0.0.0.0", "::"):
         ALLOWED_HOSTS.add(args.host.strip("[]").lower())
     else:
         print("[注意] すべてのネットワークに公開しています。KEYCHANGER_ALLOWED_HOSTS に"
               "この PC のアドレスを指定しないと、他の端末からは開けません。")
-    url = f"http://127.0.0.1:{args.port}"
+    global _app_url
+    url = _app_url = f"http://127.0.0.1:{port}"
     print("=" * 50)
     print(" キー変更アプリを起動しました")
+    if wanted and port != wanted:
+        print(f" (ポート {wanted} はほかのアプリが使用中のため、{port} 番を使います)")
     print(f" ブラウザで {url} を開いてください")
     print(" 終了するにはこの画面で Ctrl + C を押すか、ウィンドウを閉じます")
     print("=" * 50)
     if not audio.find_ffmpeg():
         print("[注意] ffmpeg が見つかりません。README の手順でインストールしてください。")
     if args.open:
-        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+        timer = threading.Timer(BROWSER_DELAY, lambda: webbrowser.open(url))
+        timer.daemon = True
+        timer.start()
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
+    try:
+        server.run(sockets=[sock])
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
+    if not server.started:
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":

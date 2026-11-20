@@ -65,7 +65,7 @@ YouTube などの動画サイトの URL(または音声ファイル)から音声
 **`start.bat` をダブルクリック** します。
 
 - 黒い画面が開き、初回は部品のインストールで数分かかります。
-- 準備ができると自動でブラウザに `http://127.0.0.1:8000` が開きます。
+- 準備ができると自動でブラウザに `http://127.0.0.1:8000` が開きます(8000 番がほかのアプリで使用中なら、空いている番号で開きます)。
 - 「Windows によって PC が保護されました」と出たら「詳細情報」→「実行」を押してください。
 
 ### Mac
@@ -151,7 +151,7 @@ Linux(Ubuntu など)で「仮想環境を作れませんでした」と出る場
 
 ### その他
 
-- ポート 8000 がほかのアプリで使われていると起動できません。その場合は環境変数 `KEYCHANGER_PORT` で変更できます。
+- ポート 8000 がほかのアプリで使われているときは、空いている番号(8001 など)を自動で選んで起動します。開くアドレスは黒い画面に表示されます。番号を決めておきたいときは環境変数 `KEYCHANGER_PORT` で指定できます(指定した番号が使用中の場合は、ほかの番号には移らず、その旨を表示して終了します)。
 - キーを変えたあと、次に聴きそうな隣のキーを先回りして変換するため、少しの間パソコンのファンが回ることがあります。気になる場合は環境変数 `KEYCHANGER_PREFETCH=0` で止められます。
 - ログインが必要な動画・非公開動画・ライブ配信・ネットラジオ・プレイリストには対応していません。
 - 著作権のある音源は、個人的な練習など法律で認められた範囲でご利用ください。
@@ -167,7 +167,8 @@ Linux(Ubuntu など)で「仮想環境を作れませんでした」と出る場
   - 先回り変換: あるキーを変換し終えたら、その隣(±1)を裏で変換しておきます(`app.Prefetcher`)。利用者が別のキーを頼んだら先回りは中断して譲ります。
   - 取り消し: 変換中に別のキーへ変えると、要らなくなった変換は止めます(`/api/render` は 409 を返し、画面側は無視します)。
 - キャッシュ: OS の一時フォルダの `key-changer-cache`(`KEYCHANGER_CACHE` で変更可)。起動時と読み込み時に、7 日より古いものと合計 2GB(`KEYCHANGER_CACHE_MB`)を超えた分を古い順に削除。
-- 設定(環境変数): `KEYCHANGER_HOST`(既定 127.0.0.1)、`KEYCHANGER_PORT`(8000)、`KEYCHANGER_MAX_MINUTES`(20)、`KEYCHANGER_MAX_MB`(200)、`KEYCHANGER_MAX_DOWNLOAD_MINUTES`(15、ダウンロードにかけてよい時間)、`KEYCHANGER_NO_RUBBERBAND=1`(簡易方式を強制)、`KEYCHANGER_JOBS`(並列変換に使うプロセス数。既定は CPU のコア数で最大 16、`1` で並列変換をやめる)、`KEYCHANGER_PREFETCH=0`(先回り変換をやめる)、`KEYCHANGER_FFMPEG`(ffmpeg の場所)、`KEYCHANGER_ALLOWED_HOSTS`(127.0.0.1 / localhost 以外の Host 名で開く場合にカンマ区切りで指定。DNS リバインディング対策で、それ以外の Host ヘッダーは拒否します)
+- 設定(環境変数): `KEYCHANGER_HOST`(既定 127.0.0.1)、`KEYCHANGER_PORT`(未指定なら 8000、使用中なら 8001〜8019、それも無ければ OS が選んだ空き番号。指定したときはその番号だけを使う)、`KEYCHANGER_MAX_MINUTES`(20)、`KEYCHANGER_MAX_MB`(200)、`KEYCHANGER_MAX_DOWNLOAD_MINUTES`(15、ダウンロードにかけてよい時間)、`KEYCHANGER_NO_RUBBERBAND=1`(簡易方式を強制)、`KEYCHANGER_JOBS`(並列変換に使うプロセス数。既定は CPU のコア数で最大 16、`1` で並列変換をやめる)、`KEYCHANGER_PREFETCH=0`(先回り変換をやめる)、`KEYCHANGER_FFMPEG`(ffmpeg の場所)、`KEYCHANGER_ALLOWED_HOSTS`(127.0.0.1 / localhost 以外の Host 名で開く場合にカンマ区切りで指定。DNS リバインディング対策で、それ以外の Host ヘッダーは拒否します)
+- Windows 用の `start.bat` / `update.bat` は英数字(ASCII)だけで書きます。日本語(UTF-8)と `chcp 65001` を同じバッチファイルに入れると、cmd.exe がファイルの読む位置を見失い、後ろの行の途中をコマンドとして実行してしまいます(`'hon' is not recognized ...` と出る不具合の原因でした)。Python が無いときの日本語の案内は `docs/python-not-found.txt` に置いてあります。
 - テスト:
 
   ```
