@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -20,7 +21,7 @@ import uuid
 import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
@@ -36,6 +37,15 @@ ID_RE = re.compile(r"^[0-9a-f]{20}$")
 JOB_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def _prefetch_span() -> int:
+    """環境変数 KEYCHANGER_PREFETCH: 先回りして変換しておく範囲(0 = しない、1 = 隣だけ。既定は 2 つ隣まで)。"""
+    try:
+        n = int(os.environ.get("KEYCHANGER_PREFETCH", "").strip() or 2)
+    except ValueError:
+        n = 2
+    return max(0, min(n, 3))
+
+
 @dataclass
 class Settings:
     cache_dir: Path = field(default_factory=lambda: Path(
@@ -49,8 +59,10 @@ class Settings:
     part_max_age: float = 3600  # これより古い作業中ファイル(.part)は消す(変換のタイムアウトは 900 秒)
     engine: str | None = None  # None = 自動(rubberband があれば使う)
     jobs: int | None = None    # 並列変換に使うプロセス数。None = 自動(CPU のコア数)、1 = 並列にしない
-    # 聴いているキーの隣(±1)を先回りして変換しておく
-    prefetch: bool = os.environ.get("KEYCHANGER_PREFETCH", "1") != "0"
+    # 聴いているキーの近く(±この数まで)を先回りして変換しておく。0 = 先回りしない
+    # (0 のときは、保存用の MP3 を前もって作っておくこともしない)
+    prefetch: int = _prefetch_span()
+    prefetch_long: float = 600  # これより長い音源は、先回りを隣(±1)までにする(時間もディスクも使うので)
 
 
 settings = Settings()
@@ -102,14 +114,85 @@ def read_meta(source_id: str) -> dict | None:
 
 
 def write_meta(source_id: str, meta: dict) -> None:
+    """meta.json を書き直す(読んでいる途中のものに中途半端な内容を見せないよう、置き換える)。"""
     p = sources_dir() / source_id / "meta.json"
-    p.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    tmp = p.with_name(f"meta.{uuid.uuid4().hex}.part")
+    try:
+        tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def render_path(source_id: str, semitones: int) -> Path:
+    """キーを変えた音声(再生用の WAV)の置き場所。"""
+    check_id(source_id)
+    audio.validate_semitones(semitones)
+    return renders_dir() / f"{source_id}_{semitones:+d}.wav"
+
+
+def mp3_path(source_id: str, semitones: int) -> Path:
+    """保存(ダウンロード)用の MP3 の置き場所。"""
     check_id(source_id)
     audio.validate_semitones(semitones)
     return renders_dir() / f"{source_id}_{semitones:+d}.mp3"
+
+
+# ブラウザの <audio> にそのまま渡して再生できる音源。拡張子 → (ffmpeg での入れ物の呼び名, 音声の形式, 種類)
+# 読み込んだ音源がこれに当てはまれば、原曲キーは作り直さずにそのまま再生する(読み込みが速くなる)。
+# 少しでも怪しいもの(MP3 は可変ビットレートだと再生位置がずれることがある、など)は入れていない。
+# 当てはまらない音源は、これまでどおり変換したもの(WAV)を再生する。
+_DIRECT: dict[str, tuple[str, frozenset[str], str]] = {
+    ".m4a": ("mp4", frozenset({"aac"}), "audio/mp4"),
+    ".mp4": ("mp4", frozenset({"aac"}), "audio/mp4"),
+    ".webm": ("webm", frozenset({"opus", "vorbis"}), "audio/webm"),
+    ".ogg": ("ogg", frozenset({"opus", "vorbis"}), "audio/ogg"),
+    ".oga": ("ogg", frozenset({"opus", "vorbis"}), "audio/ogg"),
+    ".opus": ("ogg", frozenset({"opus"}), "audio/ogg"),
+    ".wav": ("wav", frozenset({"pcm_s16le"}), "audio/wav"),
+    ".flac": ("flac", frozenset({"flac"}), "audio/flac"),
+}
+
+
+def direct_media_type(src: Path, info: dict) -> str | None:
+    """音源をそのままブラウザで再生できるなら、その種類(Content-Type)を返す。info は audio.probe の結果。"""
+    rule = _DIRECT.get(src.suffix.lower())
+    if rule is None:
+        return None
+    container, codecs, media_type = rule
+    if container not in (info.get("format") or "").split(","):
+        return None  # 拡張子と中身が合っていない
+    if info.get("codec") not in codecs or info.get("audio_streams") != 1 or info.get("video"):
+        return None
+    if info.get("codec") == "aac" and info.get("profile") not in ("LC", "HE-AAC", "HE-AACv2"):
+        return None
+    # 5.1ch などは、ブラウザと ffmpeg でステレオへの混ぜ方が違う(キーを変えたときと聞こえ方が変わる)
+    if info.get("layout") not in ("mono", "stereo", "1 channels", "2 channels"):
+        return None
+    # 長さが分からない・途中の時刻から始まる音声は、再生位置がずれるのでそのままは使わない
+    if not info.get("duration") or abs(info.get("start") or 0.0) > 0.1:
+        return None
+    return media_type
+
+
+def direct_type(source_id: str) -> str | None:
+    """この音源をそのままブラウザで再生できるなら、その種類を返す(できないなら None)。"""
+    meta = read_meta(source_id)
+    src = source_path(source_id)
+    if meta is None or src is None:
+        return None
+    if "direct" not in meta:
+        # 前のバージョンで読み込んだ音源。調べて、次からのために覚えておく
+        try:
+            meta["direct"] = direct_media_type(src, audio.probe(src))
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return None
+        try:
+            write_meta(source_id, meta)
+        except OSError:
+            pass  # 覚えられなくても、次にまた調べるだけ
+    rule = _DIRECT.get(src.suffix.lower())
+    return rule[2] if rule and meta.get("direct") == rule[2] else None
 
 
 def _touch(p: Path) -> None:
@@ -119,11 +202,13 @@ def _touch(p: Path) -> None:
         pass
 
 
-def cleanup_cache(startup: bool = False) -> None:
+def cleanup_cache(startup: bool = False, protect: Iterable[Path] = ()) -> None:
     """古いファイルを消し、合計サイズが上限を超えていれば古い順に消す。
 
     startup=True(起動時)は、前回の起動で途中になった並列変換の作業フォルダも消す。
+    protect に渡したもの(いまから使う音源のフォルダや変換結果)は消さない。
     """
+    protect = set(protect)
     root = settings.cache_dir
     root.mkdir(parents=True, exist_ok=True)
     sources_dir().mkdir(exist_ok=True)
@@ -163,16 +248,33 @@ def cleanup_cache(startup: bool = False) -> None:
 
     keep = []
     for mtime, size, p in entries:
-        if now - mtime > settings.max_cache_age:
+        if now - mtime > settings.max_cache_age and p not in protect:
             remove_path(p)
         else:
             keep.append((mtime, size, p))
     keep.sort()
     total = sum(s for _, s, _ in keep)
-    while keep and total > settings.max_cache_bytes:
-        _, size, p = keep.pop(0)
-        remove_path(p)
-        total -= size
+    for _, size, p in keep:  # 古い順
+        if total <= settings.max_cache_bytes:
+            break
+        if p not in protect:
+            remove_path(p)
+            total -= size
+
+
+_cleanup_lock = threading.Lock()
+
+
+def tidy_cache(*protect: Path) -> None:
+    """キャッシュの掃除を、失敗しても気にせずに行う(ほかで掃除中なら何もしない)。"""
+    if not _cleanup_lock.acquire(blocking=False):
+        return
+    try:
+        cleanup_cache(protect=protect)
+    except OSError:
+        pass
+    finally:
+        _cleanup_lock.release()
 
 
 def remove_path(p: Path) -> None:
@@ -239,6 +341,182 @@ def _check_duration(duration: float | None) -> None:
             f"長すぎます({fmt_minutes(duration)})。{int(settings.max_duration // 60)}分以内の音声にしてください。")
 
 
+# 音声だけを取る。5.1ch などのサラウンド版は容量が 3 倍ほどあり(その分ダウンロードが遅い)、
+# どのみちステレオに直して使うので、ステレオ版があればそちらを選ぶ。
+AUDIO_FORMAT = "bestaudio[audio_channels<=?2]/bestaudio/best"
+FRAGMENT_THREADS = 4  # 細切れで配信される音声(HLS など)を、いくつ並行してダウンロードするか
+
+
+class _YdlLogger:
+    """yt-dlp の警告を集める(エラーを分かりやすい言葉に直すときの手がかりにする)。"""
+
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): self.warnings.append(str(msg))
+    def error(self, msg): pass
+
+
+def _ydl_opts(logger: _YdlLogger, work: Path | None = None, hook=None) -> dict:
+    """yt-dlp の設定。work を渡すと、そのフォルダへダウンロードする設定を足す。"""
+    opts = {
+        "format": AUDIO_FORMAT,
+        "noplaylist": True,
+        "extract_flat": "in_playlist",
+        "quiet": True,
+        "no_warnings": False,
+        "noprogress": True,
+        "logger": logger,
+        "socket_timeout": 30,
+        "retries": 3,
+        "cachedir": False,
+        "ffmpeg_location": audio.find_ffmpeg(),
+    }
+    if work is not None:
+        opts.update({
+            "outtmpl": str(work / "source.%(ext)s"),
+            "paths": {"home": str(work), "temp": str(work)},
+            "max_filesize": settings.max_filesize,
+            "progress_hooks": [hook],
+            "overwrites": True,
+            "concurrent_fragment_downloads": FRAGMENT_THREADS,
+        })
+    return opts
+
+
+def _check_info(info: dict | None) -> dict:
+    """ダウンロードを始める前に、対応していないもの(プレイリスト・ライブ・長すぎる)を断る。"""
+    if info is None:
+        raise UserError("情報を取得できませんでした。")
+    if info.get("_type") in ("playlist", "multi_video") or info.get("entries") is not None:
+        raise UserError("プレイリストには対応していません。1本の動画・曲の URL を入力してください。")
+    if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
+        raise UserError("ライブ配信には対応していません。")
+    _check_duration(info.get("duration"))
+    return info
+
+
+_YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+
+
+def _is_youtube(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _YOUTUBE_HOSTS)
+
+
+class _Extractor:
+    """YouTube の動画情報を調べるための yt-dlp を、アプリが動いている間ずっと使い回す。
+
+    使い回すと 2 曲目からは、YouTube のプレーヤーのプログラム(約 0.8MB)の取り直しと、
+    接続のやり直しが要らなくなる(通信が 5 回から 4 回に減り、0.5〜1 秒ほど速い。
+    ただし YouTube の応答時間そのものが数秒単位で揺れるので、毎回はっきり分かるほどの差ではない)。
+    ダウンロードそのものは、曲ごとに保存先などが違うので毎回新しい yt-dlp で行う。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ydl = None
+        self._logger: _YdlLogger | None = None
+        self._used = False
+
+    def _open(self):
+        import yt_dlp  # 起動を速くするため遅延 import
+        if self._ydl is None:
+            self._logger = _YdlLogger()
+            self._ydl = yt_dlp.YoutubeDL(_ydl_opts(self._logger))
+            self._used = False
+        return self._ydl
+
+    def _close(self) -> None:
+        ydl, self._ydl, self._logger = self._ydl, None, None
+        if ydl is not None:
+            try:
+                ydl.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def warm(self) -> None:
+        """最初の読み込みを待たせないよう、前もって yt-dlp を用意しておく(通信はしない)。"""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._open()
+        except Exception:  # noqa: BLE001  (用意できなくても、読み込むときにやり直す)
+            self._close()
+        finally:
+            self._lock.release()
+
+    def extract(self, url: str, logger: _YdlLogger) -> tuple[dict | None, bool] | None:
+        """動画の情報を調べて (情報, 使い回しだったか) を返す。ほかの読み込みが使っている最中なら None。
+
+        失敗したら例外(DownloadError など)。そのときは覚えている内容を捨てる。
+        例外の reused 属性が True なら、使い回していたものでの失敗(新しく作り直せば直るかもしれない)。
+        """
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            ydl = self._open()
+            reused, self._used = self._used, True
+            self._logger.warnings = logger.warnings
+            try:
+                return ydl.extract_info(url, download=False), reused
+            except BaseException as e:
+                self._close()
+                try:
+                    e.reused = reused
+                except AttributeError:
+                    pass
+                raise
+        finally:
+            if self._logger is not None:
+                self._logger.warnings = []
+            self._lock.release()
+
+    def close(self) -> None:
+        with self._lock:
+            self._close()
+
+
+_extractor = _Extractor()
+
+
+def _fetch(url: str, work: Path, hook, logger: _YdlLogger) -> dict:
+    """yt-dlp で動画の情報を調べ、音声を work にダウンロードして、情報を返す。"""
+    import yt_dlp  # 起動を速くするため遅延 import
+
+    def fresh() -> dict:
+        # 1 つの yt-dlp で、調べるところからダウンロードまで行う(これまでどおりのやり方)
+        with yt_dlp.YoutubeDL(_ydl_opts(logger, work, hook)) as ydl:
+            info = _check_info(ydl.extract_info(url, download=False))
+            return ydl.process_ie_result(info, download=True)
+
+    if not _is_youtube(url):
+        return fresh()
+    try:
+        got = _extractor.extract(url, logger)
+    except yt_dlp.utils.DownloadError as e:
+        if not getattr(e, "reused", False):
+            raise  # 作ったばかりの yt-dlp でも駄目だった(動画が無い、など)
+        got = None
+    except Exception:  # noqa: BLE001  (使い回しがうまくいかないときは、これまでどおりのやり方で)
+        got = None
+    if got is None:
+        del logger.warnings[:]
+        return fresh()
+    info = _check_info(got[0])
+    try:
+        with yt_dlp.YoutubeDL(_ydl_opts(logger, work, hook)) as ydl:
+            return ydl.process_ie_result(info, download=True)
+    except yt_dlp.utils.DownloadError:
+        # 念のため、これまでどおりのやり方でもう一度試す
+        del logger.warnings[:]
+        for p in list(work.iterdir()):
+            remove_path(p)
+        return fresh()
+
+
 def download_url(url: str, progress=None) -> dict:
     """URL から音声を取得してキャッシュに保存し、メタ情報を返す。"""
     import yt_dlp  # 起動を速くするため遅延 import
@@ -272,46 +550,12 @@ def download_url(url: str, progress=None) -> dict:
             if total:
                 progress(min(done / total, 1.0))
 
-    warnings: list[str] = []
-
-    class _Logger:
-        def debug(self, msg): pass
-        def info(self, msg): pass
-        def warning(self, msg): warnings.append(str(msg))
-        def error(self, msg): pass
-
-    opts = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "extract_flat": "in_playlist",
-        "outtmpl": str(work / "source.%(ext)s"),
-        "paths": {"home": str(work), "temp": str(work)},
-        "max_filesize": settings.max_filesize,
-        "quiet": True,
-        "no_warnings": False,
-        "noprogress": True,
-        "logger": _Logger(),
-        "progress_hooks": [hook],
-        "socket_timeout": 30,
-        "retries": 3,
-        "overwrites": True,
-        "cachedir": False,
-    }
-    opts["ffmpeg_location"] = audio.find_ffmpeg()
+    logger = _YdlLogger()
     try:
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if info is None:
-                    raise UserError("情報を取得できませんでした。")
-                if info.get("_type") in ("playlist", "multi_video") or info.get("entries") is not None:
-                    raise UserError("プレイリストには対応していません。1本の動画・曲の URL を入力してください。")
-                if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
-                    raise UserError("ライブ配信には対応していません。")
-                _check_duration(info.get("duration"))
-                info = ydl.process_ie_result(info, download=True)
+            info = _fetch(url, work, hook, logger)
         except yt_dlp.utils.DownloadError as e:
-            raise UserError(_translate_ytdlp_error(str(e), warnings), 502) from None
+            raise UserError(_translate_ytdlp_error(str(e), logger.warnings), 502) from None
 
         files = [p for p in work.iterdir()
                  if p.name.startswith("source.") and not p.name.endswith((".part", ".ytdl"))]
@@ -328,12 +572,14 @@ def download_url(url: str, progress=None) -> dict:
         duration = pr["duration"] or info.get("duration")
         _check_duration(duration)
         title = (info.get("title") or "").strip() or "audio"
+        final_src = work / ("source" + src.suffix.lower())
         meta = {"id": source_id, "title": title, "duration": duration,
-                "source": "url", "url": url, "created": time.time()}
+                "source": "url", "url": url, "created": time.time(),
+                "direct": direct_media_type(final_src, pr)}
         final = sources_dir() / source_id
         if final.exists():
             shutil.rmtree(final, ignore_errors=True)
-        src.rename(work / ("source" + src.suffix.lower()))
+        src.rename(final_src)
         for p in list(work.iterdir()):
             if not p.name.startswith("source."):
                 p.unlink(missing_ok=True)
@@ -380,7 +626,7 @@ def save_upload(upload: UploadFile) -> dict:
         _check_duration(pr["duration"])
         title = Path(name).stem.strip() or "audio"
         meta = {"id": source_id, "title": title, "duration": pr["duration"],
-                "source": "file", "created": time.time()}
+                "source": "file", "created": time.time(), "direct": direct_media_type(dst, pr)}
         (work / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
         final = sources_dir() / source_id
         if final.exists():
@@ -403,16 +649,19 @@ class _Render:
 
 
 _render_locks: dict[str, threading.Lock] = {}
-_render_guard = threading.Condition()  # _render_locks / _renders / _foreground を守る
+_render_guard = threading.Condition()  # _render_locks / _renders / _encodes / _foreground を守る
 _renders: list[_Render] = []
-_foreground = 0  # 利用者が待っている変換の数。1 つでもあれば先回り変換は動かさない
+_encodes: set[threading.Event] = set()  # 実行中の MP3 作成を取り消すためのイベント
+_foreground = 0  # 利用者が待っている変換・MP3 作成の数。1 つでもあれば先回り変換は動かさない
 _render_sem = threading.Semaphore(2)  # 同時変換数の上限
 
 
 def ensure_render(source_id: str, semitones: int, *, background: bool = False,
                   supersede: bool = False,
                   wanted: Callable[[], bool] | None = None) -> Path:
-    """キーを変えた MP3 を(無ければ変換して)用意し、そのパスを返す。
+    """キーを変えた音声(再生用の WAV)を(無ければ変換して)用意し、そのパスを返す。
+
+    semitones が 0 のときは、音源を WAV に直しただけのもの(音源をそのまま再生できないとき用)。
 
     background=True は先回り変換。利用者が待っている変換があるときは始めず、
     途中で利用者の変換が来たら取り消される(どちらも audio.RenderCancelled)。
@@ -459,6 +708,7 @@ def ensure_render(source_id: str, semitones: int, *, background: bool = False,
                 with _render_sem:
                     _render_to(src, out, me)
             _touch(src.parent / "meta.json")
+        tidy_cache(out, src.parent)  # 変換結果は大きいので、増えたらその場で古いものを片付ける
         return out
     finally:
         with _render_guard:
@@ -478,16 +728,112 @@ def _render_to(src: Path, out: Path, me: _Render) -> None:
         raise UserError("音声の変換に失敗しました。別の音源でお試しください。", 500) from None
 
 
+def ensure_mp3(source_id: str, semitones: int, *, cancel: threading.Event | None = None,
+               background: bool = False) -> Path:
+    """保存(ダウンロード)用の MP3 を(無ければ作って)用意し、そのパスを返す。
+
+    原曲キーは音源から直接、それ以外は変換済みの音声(WAV)から作る。
+    ふつうは「ダウンロード」を押した人が待っているので、作っている間は先回り変換に譲ってもらう
+    (利用者が待っている変換と同じ扱い)。
+    background=True は、聴いている間に前もって作っておくとき用。急ぎではないので先回り変換を
+    止めず、変換済みの音声が無ければ(そのために変換を始めたりせず)audio.RenderCancelled を送出する。
+    cancel がセットされると途中でやめて audio.RenderCancelled を送出する。
+    """
+    check_id(source_id)
+    try:
+        audio.validate_semitones(semitones)
+    except ValueError:
+        raise UserError("キーは -12 から +12 の整数で指定してください。") from None
+    src = source_path(source_id)
+    if not src:
+        raise UserError("音声が見つかりません(キャッシュが削除された可能性があります)。もう一度読み込んでください。", 404)
+    out = mp3_path(source_id, semitones)
+    if out.exists():
+        _touch(out)
+        return out
+    cancel = cancel or threading.Event()
+    global _foreground
+    with _render_guard:
+        lock = _render_locks.setdefault(out.name, threading.Lock())
+        if not background:
+            _foreground += 1
+            for r in _renders:
+                if r.background:
+                    r.cancel.set()
+    try:
+        with lock:
+            if out.exists():
+                _touch(out)
+                return out
+            if not audio.find_ffmpeg():
+                raise UserError(MSG_FFMPEG, 500)
+            if semitones == 0:
+                wav = None
+            elif not background:
+                wav = ensure_render(source_id, semitones)
+            elif (wav := render_path(source_id, semitones)).exists():
+                _touch(wav)
+            else:
+                raise audio.RenderCancelled()
+            with _render_guard:
+                _encodes.add(cancel)
+            try:
+                if wav is None:
+                    audio.encode_mp3(src, out, cancel=cancel)
+                else:
+                    audio.encode_mp3(wav, out, tags_from=src, cancel=cancel)
+            except audio.AudioError:
+                raise UserError("MP3 の作成に失敗しました。もう一度お試しください。", 500) from None
+            finally:
+                with _render_guard:
+                    _encodes.discard(cancel)
+                    _render_guard.notify_all()
+            _touch(src.parent / "meta.json")
+    finally:
+        if not background:
+            with _render_guard:
+                _foreground -= 1
+                _render_guard.notify_all()
+    tidy_cache(out, src.parent)
+    return out
+
+
+def playback(source_id: str, semitones: int, compat: bool = False, *,
+             supersede: bool = False) -> tuple[Path, str, bool]:
+    """再生する音声を(無ければ変換して)用意し、(ファイル, 種類(Content-Type), 音源そのものか) を返す。
+
+    原曲キーで、音源がそのままブラウザで再生できるものなら、音源そのものを返す(変換しない)。
+    compat=True は「そのままでは再生できなかった」という画面からの知らせで、WAV に直したものを返す。
+    supersede は ensure_render と同じ。
+    """
+    if semitones == 0 and not compat:
+        media_type = direct_type(source_id)
+        src = source_path(source_id) if media_type else None
+        if src is not None:
+            _touch(src.parent / "meta.json")
+            return src, media_type, True
+    return ensure_render(source_id, semitones, supersede=supersede), "audio/wav", False
+
+
+def is_ready(source_id: str, semitones: int, compat: bool = False) -> bool:
+    """このキーの音声を、変換を待たずにすぐ再生できるか。"""
+    if semitones == 0 and not compat and direct_type(source_id):
+        return True
+    return render_path(source_id, semitones).exists()
+
+
 def cancel_all_renders() -> None:
     with _render_guard:
         for r in _renders:
             r.cancel.set()
+        for e in _encodes:
+            e.set()
 
 
 class Prefetcher:
-    """聴いているキーの隣のキーを、空いている時間に先回りして変換しておく。
+    """聴いているキーの近くのキーを、空いている時間に先回りして変換しておく。
 
-    +/− を 1 つずつ動かしたときに待たずに済むようにするためのもの。
+    +/− を 1 つ・2 つ動かしたときに待たずに済むようにするためのもの。
     利用者が待っている変換が始まったら譲り(取り消され)、終わってから続きをやる。
     """
 
@@ -565,26 +911,124 @@ prefetcher = Prefetcher()
 _last_key: dict[str, int] = {}  # 音源ごとの、直前に聴いていたキー(動かしている向きを知るため)
 
 
-def schedule_prefetch(source_id: str, semitones: int) -> None:
-    """いま聴いているキーの隣(動かしている向きを先に)を先回り変換の対象にする。"""
-    if not settings.prefetch:
+def schedule_prefetch(source_id: str, semitones: int, compat: bool = False) -> None:
+    """いま聴いているキーの近く(近い順に、動かしている向きを先に)を先回り変換の対象にする。"""
+    span = int(settings.prefetch)
+    if span <= 0:
         return
     prev = _last_key.get(source_id)
     if len(_last_key) > 64:
         _last_key.clear()
     _last_key[source_id] = semitones
+    duration = (read_meta(source_id) or {}).get("duration")
+    if isinstance(duration, (int, float)) and duration > settings.prefetch_long:
+        span = 1
     step = -1 if prev is not None and semitones < prev else 1
-    keys = [k for k in (semitones + step, semitones - step)
-            if audio.MIN_SEMITONES <= k <= audio.MAX_SEMITONES
-            and not render_path(source_id, k).exists()]
+    near = [semitones + d * sign for d in range(1, span + 1) for sign in (step, -step)]
+    keys = [k for k in near
+            if audio.MIN_SEMITONES <= k <= audio.MAX_SEMITONES and not is_ready(source_id, k, compat)]
     prefetcher.schedule(source_id, keys)
 
 
-def safe_filename(title: str, semitones: int) -> str:
+class Mp3Maker:
+    """聴いているキーの保存用 MP3 を、少し待ってから前もって作っておく。
+
+    MP3 は「ダウンロード」を押したときに作れば足りるが、長い曲だと数秒かかるので、
+    同じキーをしばらく聴いていたら作っておき、押したときに待たせないようにする。
+    別のキーに変えられたら、作りかけのものはやめる(最後に選ばれたキーの分だけ作る)。
+    """
+
+    delay = 2.0  # 同じキーをこの秒数聴いていたら作り始める
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._target: tuple[str, int] | None = None   # 次に作るもの
+        self._due = 0.0                                # 作り始める時刻
+        self._running: tuple[str, int] | None = None  # いま作っているもの
+        self._cancel: threading.Event | None = None
+        self._thread: threading.Thread | None = None
+        self._stopping = False
+
+    def schedule(self, source_id: str, semitones: int) -> None:
+        target = (source_id, semitones)
+        with self._cv:
+            self._stopping = False
+            if self._running == target:
+                self._target = None
+            else:
+                if self._cancel is not None:
+                    self._cancel.set()
+                self._target, self._due = target, time.monotonic() + self.delay
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="mp3", daemon=True)
+                self._thread.start()
+            self._cv.notify_all()
+
+    def keep_only(self, source_id: str, semitones: int) -> None:
+        """このキー以外の分は(待っているものも、作りかけも)やめる。
+
+        別のキーが選ばれたらすぐ呼ぶ。そのキーの変換が済むまで待つと、もう聴いていないキーの
+        MP3 作りが、利用者の待っている変換と CPU を取り合ってしまう。
+        """
+        target = (source_id, semitones)
+        with self._cv:
+            if self._target != target:
+                self._target = None
+            if self._running != target and self._cancel is not None:
+                self._cancel.set()
+            self._cv.notify_all()
+
+    def stop(self) -> None:
+        with self._cv:
+            self._target = None
+            self._stopping = True
+            if self._cancel is not None:
+                self._cancel.set()
+            self._cv.notify_all()
+
+    def wait_idle(self, timeout: float = 60) -> bool:
+        """前もって作る分がすべて終わるまで待つ(テスト用)。"""
+        with self._cv:
+            return self._cv.wait_for(lambda: self._target is None and self._running is None, timeout)
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._stopping:
+                    if self._target is None:
+                        self._cv.wait()
+                    elif (left := self._due - time.monotonic()) > 0:
+                        self._cv.wait(left)
+                    else:
+                        break
+                if self._stopping:
+                    return
+                target, self._target = self._target, None
+                self._running, self._cancel = target, threading.Event()
+                cancel = self._cancel
+            try:
+                ensure_mp3(*target, cancel=cancel, background=True)
+            except Exception:  # noqa: BLE001  (作れなくても、ダウンロードのときに作り直すだけ)
+                pass
+            finally:
+                with self._cv:
+                    self._running = self._cancel = None
+                    self._cv.notify_all()
+
+
+mp3_maker = Mp3Maker()
+
+
+def schedule_mp3(source_id: str, semitones: int) -> None:
+    if int(settings.prefetch) > 0 and not mp3_path(source_id, semitones).exists():
+        mp3_maker.schedule(source_id, semitones)
+
+
+def safe_filename(title: str, semitones: int, ext: str = ".mp3") -> str:
     t = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]', "_", title or "audio").strip(" .")
     t = re.sub(r"\s+", " ", t)[:80].strip(" .") or "audio"
     key = "±0" if semitones == 0 else f"{semitones:+d}"
-    return f"{t} ({key}).mp3"
+    return f"{t} ({key}){ext}"
 
 
 # ---------------------------------------------------------------- ジョブ
@@ -597,6 +1041,7 @@ class Job:
     result: dict | None = None
     error: str | None = None
     created: float = field(default_factory=time.time)
+    done: threading.Event = field(default_factory=threading.Event, repr=False)  # 終わったらセットされる
 
 
 _jobs: dict[str, Job] = {}
@@ -605,7 +1050,8 @@ _jobs_lock = threading.Lock()
 
 def _run_job(job: Job, url: str) -> None:
     def progress(p: float) -> None:
-        job.progress = p
+        # 並行してダウンロードしていると数字が前後することがあるので、戻らないようにする
+        job.progress = max(job.progress or 0.0, p)
     try:
         meta = download_url(url, progress=progress)
         job.result = meta
@@ -617,10 +1063,11 @@ def _run_job(job: Job, url: str) -> None:
     except Exception:  # noqa: BLE001
         job.error = "予期しないエラーが発生しました。もう一度お試しください。"
         job.status = "error"
-    try:
-        cleanup_cache()
-    except OSError:
-        pass
+    job.done.set()  # 待っている画面に、すぐ知らせる
+    if job.result:
+        tidy_cache(sources_dir() / job.result["id"])
+    else:
+        tidy_cache()
 
 
 def start_job(url: str) -> Job:
@@ -644,12 +1091,15 @@ async def _lifespan(_app):
         cleanup_cache(startup=True)
     except OSError:
         pass
+    # 最初の読み込みを少しでも速くするため、yt-dlp を前もって用意しておく(通信はしない)
+    threading.Thread(target=_extractor.warm, name="warm", daemon=True).start()
     yield
     # 終了時: 動いている変換(ffmpeg)を止め、作業ファイルを片付け終わるのを少し待つ
     prefetcher.stop()
+    mp3_maker.stop()
     cancel_all_renders()
     with _render_guard:
-        _render_guard.wait_for(lambda: not _renders, timeout=5)
+        _render_guard.wait_for(lambda: not _renders and not _encodes, timeout=5)
 
 
 app = FastAPI(title="キー変更アプリ", docs_url=None, redoc_url=None, lifespan=_lifespan)
@@ -694,6 +1144,13 @@ class LoadRequest(BaseModel):
 class RenderRequest(BaseModel):
     id: str
     semitones: int
+    compat: bool = False  # 音源をそのままでは再生できなかったので、WAV に直したものを使う
+    peek: bool = False    # すぐ再生できるときだけ応える(変換は始めない)
+
+
+class Mp3Request(BaseModel):
+    id: str
+    semitones: int
 
 
 @app.get("/api/status")
@@ -717,51 +1174,82 @@ def api_load(req: LoadRequest):
 
 
 @app.get("/api/jobs/{job_id}")
-def api_job(job_id: str):
+def api_job(job_id: str, wait: float = Query(0, ge=0, le=30)):
+    """読み込みの進み具合。wait(秒)を付けると、終わるまで最長その秒数だけ待ってから応える。"""
     if not JOB_RE.fullmatch(job_id):
         raise UserError("ジョブが見つかりません。", 404)
     job = _jobs.get(job_id)
     if not job:
         raise UserError("ジョブが見つかりません。", 404)
+    if wait:
+        job.done.wait(wait)
     return {"status": job.status, "progress": job.progress, "result": job.result, "error": job.error}
 
 
 @app.post("/api/upload")
 def api_upload(file: UploadFile = File(...)):
     meta = save_upload(file)
-    try:
-        cleanup_cache()
-    except OSError:
-        pass
+    tidy_cache(sources_dir() / meta["id"])
     return meta
 
 
-def _audio_url(source_id: str, semitones: int, download: bool = False) -> str:
+def _audio_url(source_id: str, semitones: int, download: bool = False, compat: bool = False) -> str:
     u = f"/api/audio/{source_id}?semitones={semitones}"
-    return u + "&download=1" if download else u
+    if download:
+        return u + "&download=1"
+    return u + "&compat=1" if compat else u
+
+
+def _check_key(semitones: int) -> None:
+    try:
+        audio.validate_semitones(semitones)
+    except ValueError:
+        raise UserError("キーは -12 から +12 の整数で指定してください。") from None
 
 
 @app.post("/api/render")
 def api_render(req: RenderRequest):
+    """このキーの音声を再生できるようにして、その URL を返す。"""
     check_id(req.id)
-    ensure_render(req.id, req.semitones, supersede=True)
-    schedule_prefetch(req.id, req.semitones)
+    _check_key(req.semitones)
+    if req.peek and not is_ready(req.id, req.semitones, req.compat):
+        if not source_path(req.id):
+            raise UserError("音声が見つかりません(キャッシュが削除された可能性があります)。もう一度読み込んでください。", 404)
+        return {"ready": False}
+    mp3_maker.keep_only(req.id, req.semitones)
+    _, _, direct = playback(req.id, req.semitones, req.compat, supersede=True)
+    schedule_prefetch(req.id, req.semitones, req.compat)
+    schedule_mp3(req.id, req.semitones)
     meta = read_meta(req.id) or {}
-    return {"url": _audio_url(req.id, req.semitones),
-            "download_url": _audio_url(req.id, req.semitones, True),
-            "filename": safe_filename(meta.get("title", "audio"), req.semitones)}
+    return {"ready": True, "direct": direct,
+            "url": _audio_url(req.id, req.semitones, compat=req.compat and req.semitones == 0),
+            "download_url": _audio_url(req.id, req.semitones, download=True),
+            "filename": safe_filename(meta.get("title", "audio"), req.semitones),
+            "mp3": mp3_path(req.id, req.semitones).exists()}
+
+
+@app.post("/api/mp3")
+def api_mp3(req: Mp3Request):
+    """保存用の MP3 を(無ければ)作る。画面は、これが済んでからダウンロードを始める。"""
+    check_id(req.id)
+    ensure_mp3(req.id, req.semitones)
+    return {"ready": True}
 
 
 @app.get("/api/audio/{source_id}")
-def api_audio(source_id: str, semitones: int = Query(0, ge=-12, le=12), download: int = 0):
+def api_audio(source_id: str, semitones: int = Query(0, ge=-12, le=12), download: int = 0,
+              compat: int = 0):
     check_id(source_id)
-    path = ensure_render(source_id, semitones)
+    if download:
+        path, media_type = ensure_mp3(source_id, semitones), "audio/mpeg"
+    else:
+        path, media_type, _ = playback(source_id, semitones, bool(compat))
     meta = read_meta(source_id) or {}
-    name = safe_filename(meta.get("title", "audio"), semitones)
+    name = safe_filename(meta.get("title", "audio"), semitones, path.suffix)
     disp = "attachment" if download else "inline"
     headers = {"Content-Disposition": f"{disp}; filename=\"{_ascii_name(name)}\"; filename*=UTF-8''{quote(name)}",
                "Cache-Control": "no-cache"}
-    return FileResponse(path, media_type="audio/mpeg", headers=headers)
+    return FileResponse(path, media_type=media_type, headers=headers)
 
 
 def _ascii_name(name: str) -> str:
