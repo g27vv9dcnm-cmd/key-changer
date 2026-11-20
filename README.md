@@ -162,6 +162,13 @@ Linux(Ubuntu など)で「仮想環境を作れませんでした」と出る場
 
 - 構成: `app.py`(FastAPI サーバー)、`audio.py`(ffmpeg による変換)、`static/`(画面)、`launcher.py`(venv 作成と起動)
 - キー変更: ffmpeg の `rubberband` フィルタ(`pitch=2^(n/12)`, `tempo=1`)。無い場合は `asetrate` + `aresample` + `atempo` で代替。0 のときは MP3 に変換するだけ。
+- 音質の設定(`audio.RUBBERBAND_OPTS` など):
+  - `formant=preserved`: 声の響き(フォルマント)を保ち、キーを上げても甲高い声・下げてもこもった声になりにくくします。
+  - `channels=together`: 左右をまとめて処理し、音の広がりが崩れないようにします。
+  - `pitchq=quality`: 音程変更の計算を高品質にします。
+  - サンプルレート変換は、ffmpeg に soxr が入っていれば高品質な `resampler=soxr:precision=28` を使います(`KEYCHANGER_NO_SOXR=1` で無効)。
+  - MP3 は 320kbps で書き出します。
+  - 設定を変えたら `audio.RENDER_VERSION` を上げます。キャッシュのファイル名に入るので、古い設定で変換した音は使われなくなります。
 - 変換の高速化(rubberband のとき):
   - 並列変換: rubberband は CPU を 1 コアしか使わないので、20 秒以上の音声は 10 秒以上の区間に区切り、区間ごとに ffmpeg を並列に走らせます(`audio._render_parallel`)。隣り合う区間は 1 秒ずつ重ねて変換し、その中で 2 つの波形が最もよく一致する場所を探して約 23 ミリ秒のクロスフェードでつなぎます。つないだ音は、できた順に MP3 エンコーダーへ流し込みます。途中で失敗したら従来どおり 1 本で変換し直します。作業ファイルはキャッシュの `renders/*.part` フォルダに置き、終わったら消します(4 分の曲で一時的に 200MB 近く使います)。
   - 先回り変換: あるキーを変換し終えたら、その隣(±1)を裏で変換しておきます(`app.Prefetcher`)。利用者が別のキーを頼んだら先回りは中断して譲ります。

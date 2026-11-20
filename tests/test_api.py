@@ -557,3 +557,9 @@ def test_prefetch_resumes_after_yielding(client, fake_prefetch):
     fake.release.set()
     assert appmod.prefetcher.wait_idle(10)
     assert rendered_keys(sid) == [-1, 0, 1, 7]
+
+
+def test_render_path_includes_quality_version():
+    # 音質の設定を変えたら、古い設定で変換したキャッシュは使わない
+    p = appmod.render_path("a" * 20, 3)
+    assert p.name == f"{'a' * 20}_+3_{audio.RENDER_VERSION}.mp3"
