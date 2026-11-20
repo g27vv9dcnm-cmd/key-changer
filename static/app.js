@@ -9,16 +9,30 @@
     keyValue: $("key-value"), keyLabel: $("key-label"), rendering: $("rendering"),
     player: $("player"), download: $("download"), engineNote: $("engine-note"),
   };
+  // seq:      キーを変える・曲を読み込むたびに増える番号(古い操作への返事を見分ける)
+  // applied:  プレーヤーに反映し終えた操作の番号
   // playerId: プレーヤーに今読み込まれている音源の ID(別の曲なら再生位置を引き継がない)
-  const state = { id: null, title: "", semitones: 0, renderSeq: 0, debounce: null, busy: false, playerId: null };
+  // shown:    プレーヤーに今読み込まれている音声 { id, n, direct }(direct = 音源そのものを再生している)
+  // compat:   音源そのものをこのブラウザで再生できなかった音源の ID(変換したものを使う)
+  // resume:   キーを切り替えたあとに戻す再生位置 { pos, playing }(読み込みが済んだら戻して消す)
+  // dl:       ダウンロードボタンの中身 { id, n, ready }(ready = MP3 がもう出来ている)
+  const state = {
+    id: null, title: "", semitones: 0, seq: 0, applied: 0, debounce: null, peekTimer: null, spinner: null,
+    busy: false, playerId: null, shown: null, compat: {}, resume: null, dl: null,
+  };
+
+  const MAKING_MP3 = "MP3 を作成中…";
 
   function disableDownload() {
+    state.dl = null;
+    if (els.download.textContent === MAKING_MP3) els.download.textContent = "ダウンロード (MP3)";
     els.download.setAttribute("aria-disabled", "true");
     els.download.removeAttribute("href");
     els.download.setAttribute("tabindex", "-1");
   }
 
-  function enableDownload(url, filename, n) {
+  function enableDownload(url, filename, id, n, ready) {
+    state.dl = { id: id, n: n, ready: ready };
     els.download.href = url;
     els.download.setAttribute("download", filename);
     els.download.textContent = "ダウンロード (" + keyText(n) + ", MP3)";
@@ -32,6 +46,8 @@
     p.removeAttribute("src");
     p.load();
     state.playerId = null;
+    state.shown = null;
+    state.resume = null;
   }
 
   function showError(msg) {
@@ -124,14 +140,16 @@
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }),
       });
       for (;;) {
-        await sleep(700);
-        const j = await api("/api/jobs/" + job);
+        // 終わるまで(最長 1 秒)サーバー側で待ってもらう。終わったらすぐ返事が来る
+        const asked = Date.now();
+        const j = await api("/api/jobs/" + job + "?wait=1");
         if (j.status === "done") { onLoaded(j.result); break; }
         if (j.status === "error") throw new Error(j.error || "ダウンロードに失敗しました。");
         if (j.progress != null) {
           setProgress(j.progress);
           els.loadingText.textContent = "ダウンロード中… " + Math.round(j.progress * 100) + "%";
         }
+        if (Date.now() - asked < 300) await sleep(300); // すぐ返事が来たときに問い合わせを連発しない
       }
     } catch (e) {
       showError(e.message);
@@ -158,8 +176,10 @@
     }
   }
 
-  // delay: 変換を頼むまでの待ち時間(ミリ秒)。続けて操作している間は頼まない
-  function setKey(n, delay) {
+  // delay:     変換を頼むまでの待ち時間(ミリ秒)。続けて操作している間は頼まない
+  // peekDelay: 「もう変換済みなら、すぐ切り替える」ための問い合わせを出すまでの待ち時間。
+  //            近くのキーは先回りで変換済みのことが多いので、変換を頼むより先に聞いてみる
+  function setKey(n, delay, peekDelay) {
     n = Math.max(-12, Math.min(12, Math.round(n)));
     state.semitones = n;
     els.slider.value = String(n);
@@ -168,62 +188,111 @@
     els.minus.disabled = n <= -12;
     els.plus.disabled = n >= 12;
     disableDownload();
-    state.renderSeq++; // 実行中の古い変換結果は使わない
-    els.rendering.hidden = false;
+    const seq = ++state.seq; // 実行中の古い変換結果は使わない
     clearTimeout(state.debounce);
-    state.debounce = setTimeout(renderCurrent, delay === undefined ? 450 : delay);
+    clearTimeout(state.peekTimer);
+    clearTimeout(state.spinner);
+    if (delay === undefined) delay = 450;
+    // 変換済みのキーに切り替えるだけのときに「変換中」が一瞬ちらつかないよう、少し遅らせて出す
+    state.spinner = setTimeout(() => { els.rendering.hidden = false; }, 150);
+    state.debounce = setTimeout(() => renderCurrent(seq, false), delay);
+    if (delay > 0) state.peekTimer = setTimeout(() => renderCurrent(seq, true), peekDelay || 0);
   }
 
-  async function renderCurrent() {
-    if (!state.id) return;
-    const seq = ++state.renderSeq;
+  // peek = true: 変換済みのときだけ切り替える(まだなら何もしない。あとで peek = false の依頼が来る)
+  async function renderCurrent(seq, peek) {
+    if (!state.id || seq !== state.seq) return;
     const n = state.semitones;
     const id = state.id;
-    disableDownload();
-    els.rendering.hidden = false;
-    showError("");
+    if (!peek) showError("");
     try {
       const r = await api("/api/render", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: id, semitones: n }),
+        body: JSON.stringify({ id: id, semitones: n, compat: !!state.compat[id], peek: peek }),
       });
-      // もっと新しい操作(キー変更・別の曲の読み込み)がある
-      if (seq !== state.renderSeq || n !== state.semitones || id !== state.id) return;
+      // もっと新しい操作(キー変更・別の曲の読み込み)がある / もう反映した / まだ変換されていない
+      if (seq !== state.seq || state.applied === seq || !r.ready) return;
+      state.applied = seq;
+      clearTimeout(state.debounce);
+      clearTimeout(state.spinner);
+      showError("");
       const p = els.player;
-      const sameTrack = state.playerId === id;
-      const wasPlaying = sameTrack && !p.paused && !p.ended;
-      const pos = sameTrack ? (p.currentTime || 0) : 0;
+      // 同じ曲のキーを変えたときは、聴いていた位置から続ける。前の切り替えがまだ読み込み中なら
+      // (続けて切り替えたとき)、そのときに覚えた位置をそのまま使う
+      if (state.playerId !== id) state.resume = null;
+      else if (!state.resume) state.resume = { pos: p.currentTime || 0, playing: !p.paused && !p.ended };
       p.src = r.url;
       state.playerId = id;
-      if (sameTrack) {
-        p.addEventListener("loadedmetadata", function restore() {
-          p.removeEventListener("loadedmetadata", restore);
-          if (pos > 0 && pos < p.duration) p.currentTime = pos;
-          if (wasPlaying) p.play().catch(() => {});
-        });
-      }
+      state.shown = { id: id, n: n, direct: !!r.direct };
       p.load();
-      enableDownload(r.download_url, r.filename, n);
+      enableDownload(r.download_url, r.filename, id, n, !!r.mp3);
+      els.rendering.hidden = true;
     } catch (e) {
-      if (seq === state.renderSeq) showError(e.message);
-    } finally {
-      if (seq === state.renderSeq) els.rendering.hidden = true;
+      if (peek || seq !== state.seq) return; // peek の失敗は、このあとの本番の依頼に任せる
+      clearTimeout(state.spinner);
+      els.rendering.hidden = true;
+      showError(e.message);
     }
+  }
+
+  // MP3 は保存するときに初めて作る(再生には使わない)。出来上がってからダウンロードを始める
+  async function download() {
+    const dl = state.dl;
+    const label = els.download.textContent;
+    els.download.setAttribute("aria-disabled", "true");
+    els.download.textContent = MAKING_MP3;
+    showError("");
+    try {
+      await api("/api/mp3", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: dl.id, semitones: dl.n }),
+      });
+    } catch (e) {
+      if (state.dl === dl) showError(e.message);
+      return;
+    } finally {
+      if (state.dl === dl) {
+        els.download.textContent = label;
+        els.download.setAttribute("aria-disabled", "false");
+      }
+    }
+    if (state.dl !== dl) return; // 作っている間に別のキー・別の曲に変えられた
+    dl.ready = true;
+    els.download.click();
   }
 
   els.form.addEventListener("submit", (e) => { e.preventDefault(); if (!state.busy) loadUrl(els.url.value); });
   els.file.addEventListener("change", () => { const f = els.file.files && els.file.files[0]; if (f) uploadFile(f); });
-  els.slider.addEventListener("input", () => setKey(parseInt(els.slider.value, 10)));
-  // ボタンは 1 つずつ動かすので短めに待つ(隣のキーは先回りで変換済みのことが多い)
+  // スライダーは動かしている途中の値も届くので、少し止まってから問い合わせる
+  els.slider.addEventListener("input", () => setKey(parseInt(els.slider.value, 10), 450, 120));
+  // ボタンは 1 つずつ動かすので短めに待つ(変換済みなら待たずに切り替わる)
   els.minus.addEventListener("click", () => setKey(state.semitones - 1, 200));
   els.plus.addEventListener("click", () => setKey(state.semitones + 1, 200));
   els.reset.addEventListener("click", () => setKey(0, 200));
-  // 準備中のダウンロードボタンはクリック・Enter でも反応させない
   els.download.addEventListener("click", (e) => {
-    if (els.download.getAttribute("aria-disabled") === "true") e.preventDefault();
+    // 準備中のダウンロードボタンはクリック・Enter でも反応させない
+    if (els.download.getAttribute("aria-disabled") === "true" || !state.dl) { e.preventDefault(); return; }
+    if (state.dl.ready) return; // MP3 はもうある。そのままダウンロードする
+    e.preventDefault();
+    download();
+  });
+  els.player.addEventListener("loadedmetadata", () => {
+    const r = state.resume;
+    state.resume = null;
+    if (!r) return;
+    if (r.pos > 0 && r.pos < els.player.duration) els.player.currentTime = r.pos;
+    if (r.playing) els.player.play().catch(() => {});
   });
   els.player.addEventListener("error", () => {
-    if (els.player.getAttribute("src")) showError("音声を再生できませんでした。もう一度お試しください。");
+    if (!els.player.getAttribute("src")) return;
+    const s = state.shown;
+    if (s && s.direct && !state.compat[s.id]) {
+      // 音源そのものを、このブラウザでは再生できなかった。変換したもの(WAV)に切り替える
+      state.compat[s.id] = true;
+      if (s.id === state.id && s.n === state.semitones) setKey(s.n, 0);
+      return;
+    }
+    showError("音声を再生できませんでした。もう一度お試しください。");
   });
 
   checkStatus();
