@@ -104,7 +104,7 @@
     els.title.textContent = meta.title;
     els.duration.textContent = fmtDuration(meta.duration);
     els.card.hidden = false;
-    setKey(0, true);
+    setKey(0, 0);
     els.card.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -158,7 +158,8 @@
     }
   }
 
-  function setKey(n, immediate) {
+  // delay: 変換を頼むまでの待ち時間(ミリ秒)。続けて操作している間は頼まない
+  function setKey(n, delay) {
     n = Math.max(-12, Math.min(12, Math.round(n)));
     state.semitones = n;
     els.slider.value = String(n);
@@ -170,7 +171,7 @@
     state.renderSeq++; // 実行中の古い変換結果は使わない
     els.rendering.hidden = false;
     clearTimeout(state.debounce);
-    state.debounce = setTimeout(renderCurrent, immediate ? 0 : 450);
+    state.debounce = setTimeout(renderCurrent, delay === undefined ? 450 : delay);
   }
 
   async function renderCurrent() {
@@ -213,9 +214,10 @@
   els.form.addEventListener("submit", (e) => { e.preventDefault(); if (!state.busy) loadUrl(els.url.value); });
   els.file.addEventListener("change", () => { const f = els.file.files && els.file.files[0]; if (f) uploadFile(f); });
   els.slider.addEventListener("input", () => setKey(parseInt(els.slider.value, 10)));
-  els.minus.addEventListener("click", () => setKey(state.semitones - 1));
-  els.plus.addEventListener("click", () => setKey(state.semitones + 1));
-  els.reset.addEventListener("click", () => setKey(0));
+  // ボタンは 1 つずつ動かすので短めに待つ(隣のキーは先回りで変換済みのことが多い)
+  els.minus.addEventListener("click", () => setKey(state.semitones - 1, 200));
+  els.plus.addEventListener("click", () => setKey(state.semitones + 1, 200));
+  els.reset.addEventListener("click", () => setKey(0, 200));
   // 準備中のダウンロードボタンはクリック・Enter でも反応させない
   els.download.addEventListener("click", (e) => {
     if (els.download.getAttribute("aria-disabled") === "true") e.preventDefault();

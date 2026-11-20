@@ -1,5 +1,5 @@
 @echo off
-chcp 65001 >nul
+rem Updates yt-dlp when YouTube stops loading.
+rem Keep this file ASCII-only (see start.bat).
 cd /d "%~dp0"
-rem YouTube が読み込めなくなったときに yt-dlp を更新します
 call start.bat --update

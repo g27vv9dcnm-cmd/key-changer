@@ -1,7 +1,13 @@
+import array
+import random
+import subprocess
+import threading
+
+import numpy as np
 import pytest
 
 import audio
-from conftest import decode, dominant_freq, needs_ffmpeg
+from conftest import FFMPEG, decode, dominant_freq, needs_ffmpeg
 
 pytestmark = needs_ffmpeg
 
@@ -82,3 +88,163 @@ def test_probe_japanese_metadata_under_cp932_locale(tmp_path, monkeypatch):
     assert p["has_audio"] and p["duration"] == pytest.approx(2.0, abs=0.1)
     out = tmp_path / "out.mp3"
     assert audio.render(src, out, 2, engine="fallback") == "fallback"
+
+
+# ---------------------------------------------------------------- 並列変換
+needs_rubberband = pytest.mark.skipif(not audio.has_rubberband(), reason="ffmpeg without rubberband")
+
+
+def test_probe_channels(tmp_path, tone_dir):
+    assert audio.probe(tone_dir / "tone440.wav")["channels"] == 2
+    mono = tmp_path / "mono.wav"
+    subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i",
+                    str(tone_dir / "tone440.wav"), "-ac", "1", str(mono)], check=True)
+    assert audio.probe(mono)["channels"] == 1
+
+
+def test_segment_frames():
+    r = audio.WORK_RATE
+    assert audio.segment_frames(240, 1) is None            # 1 プロセスなら並列にしない
+    assert audio.segment_frames(15, 8) is None             # 短い音声は並列にしない
+    assert audio.segment_frames(240, 4) == 15 * r          # 4 分 ÷ (4 × 4 区間)
+    assert audio.segment_frames(240, 16) == 10 * r         # 区間は 10 秒より短くしない
+    assert audio.segment_frames(None, 4) == 10 * r         # 長さが分からなくても並列にする
+    assert audio.segment_frames(1200, 2) % (r // 100) == 0  # 10 ミリ秒単位
+
+
+def _noise(n, seed):
+    rnd = random.Random(seed)
+    return [rnd.uniform(-1, 1) for _ in range(n)]
+
+
+@pytest.mark.parametrize("shift", [0, 5, -37, 100])
+def test_find_seam_finds_time_shift(shift):
+    ml = audio.MAX_LAG
+    x = _noise(audio.OVERLAP + 4 * ml, 1)
+    a = x[2 * ml: 2 * ml + audio.OVERLAP]
+    # b は a と同じ波形が shift サンプルだけ遅れたもの(b[ml + i + shift] == a[i])
+    b = x[ml - shift: ml - shift + audio.OVERLAP + 2 * ml]
+    p, lag, rho = audio.find_seam(a, b)
+    assert lag == shift
+    assert rho == pytest.approx(1.0, abs=1e-6)
+    assert a[p:p + audio.XFADE] == b[ml + p + lag: ml + p + lag + audio.XFADE]
+
+
+def test_find_seam_picks_the_place_where_waveforms_agree():
+    ml = audio.MAX_LAG
+    a = _noise(audio.OVERLAP, 2)
+    b = _noise(audio.OVERLAP + 2 * ml, 3)       # ほとんどの場所では a と無関係
+    lo, hi = 22050, 22050 + 4000                # ここだけ a と一致している
+    b[ml + lo: ml + hi] = a[lo:hi]
+    p, lag, rho = audio.find_seam(a, b)
+    assert lag == 0 and lo <= p <= hi - audio.XFADE
+    assert rho == pytest.approx(1.0, abs=1e-6)
+
+
+def test_find_seam_silence():
+    p, lag, rho = audio.find_seam([0.0] * audio.OVERLAP, [0.0] * (audio.OVERLAP + 2 * audio.MAX_LAG))
+    assert rho == 1.0 and 0 <= p <= audio.OVERLAP - audio.XFADE
+
+
+def test_crossfade():
+    n, ch = audio.XFADE, 2
+    ones = array.array("f", [1.0] * (n * ch)).tobytes()
+    zeros = bytes(len(ones))
+    same = np.frombuffer(audio.crossfade(ones, ones, ch, 1.0), dtype="<f4")
+    assert np.allclose(same, 1.0, atol=1e-6)            # 同じ波形どうしなら何も変わらない
+    fade = np.frombuffer(audio.crossfade(ones, zeros, ch, 1.0), dtype="<f4").reshape(n, ch)
+    assert np.all(np.diff(fade[:, 0]) < 0) and fade[0, 0] > 0.99 and fade[-1, 0] < 0.01
+    assert np.array_equal(fade[:, 0], fade[:, 1])
+    # 一致していない波形どうし(rho=0)では、真ん中で音量が下がらないよう持ち上げる
+    mid = np.frombuffer(audio.crossfade(ones, zeros, ch, 0.0), dtype="<f4").reshape(n, ch)[n // 2, 0]
+    assert mid == pytest.approx(2 ** -0.5, abs=0.01)
+
+
+def _frame_db(x, size=441):
+    n = len(x) // size
+    return 10 * np.log10((x[:n * size].reshape(n, size) ** 2).mean(axis=1) + 1e-12)
+
+
+@needs_rubberband
+@pytest.mark.parametrize("semitones", [3, -4])
+def test_parallel_render_matches_single(tmp_path, tone_dir, monkeypatch, semitones):
+    """区切って並列に変換しても、1 本で変換したときと同じ長さ・音程・音量になること。"""
+    monkeypatch.setattr(audio, "SEGMENT_MIN_SEC", 3.0)   # 14 秒の音源でも 5 区間に分かれるようにする
+    seams = []
+    real = audio.find_seam
+    monkeypatch.setattr(audio, "find_seam", lambda a, b: seams.append(real(a, b)) or seams[-1])
+    src = tone_dir / "song.wav"
+    par, one = tmp_path / "par.mp3", tmp_path / "one.mp3"
+    assert audio.render(src, par, semitones, engine="rubberband", jobs=4) == "rubberband"
+    assert len(seams) == 4                                # 並列の経路を通った(つなぎ目が 4 つ)
+    audio.render(src, one, semitones, engine="rubberband", jobs=1)
+    assert len(seams) == 4                                # jobs=1 は従来どおり 1 本で変換
+    a, b = decode(par), decode(one)
+    assert abs(len(a) - len(b)) < 0.03 * 44100
+    assert dominant_freq(a) == pytest.approx(330 * 2 ** (semitones / 12), rel=0.01)
+    assert dominant_freq(a) == pytest.approx(dominant_freq(b), rel=0.005)
+    da, db = _frame_db(a)[20:-20], _frame_db(b)[20:-20]   # 10 ミリ秒ごとの音量
+    assert da.mean() == pytest.approx(db.mean(), abs=0.5)
+    assert da.min() > db.min() - 3                        # つなぎ目で音が途切れていない
+    assert da.max() < db.max() + 3
+    assert all(rho > 0.8 for _, _, rho in seams), seams   # つなぎ目では波形がよく一致している
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["one.mp3", "par.mp3"]  # 作業ファイルが残らない
+
+
+@needs_rubberband
+def test_parallel_render_keeps_mono_and_tags(tmp_path, tone_dir, monkeypatch):
+    monkeypatch.setattr(audio, "SEGMENT_MIN_SEC", 3.0)
+    src = tmp_path / "mono.mp3"
+    subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(tone_dir / "song.wav"),
+                    "-ac", "1", "-metadata", "title=夜に駆ける", str(src)], check=True)
+    out = tmp_path / "out.mp3"
+    audio.render(src, out, 2, engine="rubberband", jobs=4)
+    info = subprocess.run([FFMPEG, "-hide_banner", "-i", str(out)], capture_output=True,
+                          encoding="utf-8", errors="replace").stderr
+    assert "夜に駆ける" in info
+    assert audio.probe(out)["channels"] == 1
+    assert audio.probe(out)["duration"] == pytest.approx(14.0, abs=0.1)
+
+
+@needs_rubberband
+def test_parallel_render_falls_back_to_single(tmp_path, tone_dir, monkeypatch):
+    """並列変換の途中で失敗しても、1 本での変換に切り替えて最後まで変換できること。"""
+    monkeypatch.setattr(audio, "SEGMENT_MIN_SEC", 3.0)
+
+    def boom(a, b):
+        raise audio.AudioError("boom")
+    monkeypatch.setattr(audio, "find_seam", boom)
+    out = tmp_path / "out.mp3"
+    audio.render(tone_dir / "song.wav", out, 2, engine="rubberband", jobs=4)
+    assert dominant_freq(decode(out)) == pytest.approx(330 * 2 ** (2 / 12), rel=0.01)
+    assert [p.name for p in tmp_path.iterdir()] == ["out.mp3"]
+
+
+@needs_rubberband
+@pytest.mark.parametrize("jobs", [1, 4])
+def test_render_can_be_cancelled(tmp_path, tone_dir, monkeypatch, jobs):
+    monkeypatch.setattr(audio, "SEGMENT_MIN_SEC", 3.0)
+    cancel = threading.Event()
+    real = audio.subprocess.Popen
+    started = []
+
+    def popen(cmd, *a, **kw):
+        proc = real(cmd, *a, **kw)
+        started.append(proc)
+        if any("rubberband" in str(c) for c in cmd):
+            cancel.set()   # キー変換が始まったところで取り消す
+        return proc
+    monkeypatch.setattr(audio.subprocess, "Popen", popen)
+    out = tmp_path / "out.mp3"
+    with pytest.raises(audio.RenderCancelled):
+        audio.render(tone_dir / "song.wav", out, 5, engine="rubberband", jobs=jobs, cancel=cancel)
+    assert list(tmp_path.iterdir()) == []                 # 途中のファイルを残さない
+    assert started and all(p.poll() is not None for p in started)  # ffmpeg を残さない
+
+
+def test_render_already_cancelled(tmp_path, tone_dir):
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(audio.RenderCancelled):
+        audio.render(tone_dir / "tone440.wav", tmp_path / "out.mp3", 2, engine="fallback", cancel=cancel)
+    assert list(tmp_path.iterdir()) == []
