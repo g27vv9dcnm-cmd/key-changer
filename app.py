@@ -646,6 +646,7 @@ class _Render:
     semitones: int
     background: bool  # True = 先回り変換
     cancel: threading.Event = field(default_factory=threading.Event)
+    prepare: bool = False  # True = 保存用に前もって用意している変換(リアルタイム再生のとき。誰も待っていない)
 
 
 _render_locks: dict[str, threading.Lock] = {}
@@ -657,7 +658,7 @@ _render_sem = threading.Semaphore(2)  # 同時変換数の上限
 
 
 def ensure_render(source_id: str, semitones: int, *, background: bool = False,
-                  supersede: bool = False,
+                  supersede: bool = False, prepare: bool = False,
                   wanted: Callable[[], bool] | None = None) -> Path:
     """キーを変えた音声(再生用の WAV)を(無ければ変換して)用意し、そのパスを返す。
 
@@ -665,9 +666,15 @@ def ensure_render(source_id: str, semitones: int, *, background: bool = False,
 
     background=True は先回り変換。利用者が待っている変換があるときは始めず、
     途中で利用者の変換が来たら取り消される(どちらも audio.RenderCancelled)。
-    wanted は「この先回り変換がまだ必要か」を返す関数で、不要になっていたら始めない。
+    wanted は「この先回り変換(または prepare の変換)がまだ必要か」を返す関数で、不要になっていたら始めない。
     supersede=True は「この音源の、ほかのキーへの変換はもう要らない」という意味で、
     実行中のものを取り消す(スライダーを動かして別のキーに変えたとき)。
+    prepare=True は、画面がリアルタイムでキーを変えて再生しているときに、選ばれたキーを
+    保存用に前もって変換しておくもの(`Preparer`)。聴くのには使わないので、利用者が待っている
+    変換としては数えず(先回り変換も止めない)、ほかの変換も取り消さない(画面が再生のために
+    待っている原曲キーの WAV を止めてはいけないため。前に選ばれたキーの分は `Preparer` がやめる)。
+    先回り変換ではないので、「ダウンロード」を押したときの MP3 作りに取り消されることはなく、
+    押した側は同じキーのこの変換が済むのを待って、それを使う。
     """
     check_id(source_id)
     try:
@@ -681,11 +688,14 @@ def ensure_render(source_id: str, semitones: int, *, background: bool = False,
     if out.exists():
         _touch(out)
         return out
-    me = _Render(source_id, semitones, background)
+    me = _Render(source_id, semitones, background, prepare=prepare)
     global _foreground
     with _render_guard:
         if background:
             if _foreground or (wanted is not None and not wanted()):
+                raise audio.RenderCancelled()
+        elif prepare:
+            if wanted is not None and not wanted():
                 raise audio.RenderCancelled()
         else:
             _foreground += 1
@@ -713,7 +723,7 @@ def ensure_render(source_id: str, semitones: int, *, background: bool = False,
     finally:
         with _render_guard:
             _renders.remove(me)
-            if not background:
+            if not background and not prepare:
                 _foreground -= 1
             _render_guard.notify_all()
 
@@ -857,6 +867,16 @@ class Prefetcher:
         with _render_guard:
             for r in _renders:
                 if r.background and (r.source_id, r.semitones) not in targets:
+                    r.cancel.set()
+
+    def drop(self, source_id: str) -> None:
+        """この音源の先回りをやめる(まだやっていない分は捨て、実行中のものは取り消す)。"""
+        with self._cv:
+            self._targets = [t for t in self._targets if t[0] != source_id]
+            self._cv.notify_all()
+        with _render_guard:
+            for r in _renders:
+                if r.background and r.source_id == source_id:
                     r.cancel.set()
 
     def stop(self) -> None:
@@ -1024,6 +1044,89 @@ def schedule_mp3(source_id: str, semitones: int) -> None:
         mp3_maker.schedule(source_id, semitones)
 
 
+class Preparer:
+    """画面がリアルタイムでキーを変えて再生しているとき(`/api/render` の live)に、
+    選ばれたキーを保存用に裏で変換しておく。
+
+    聴くのには使わない(画面は原曲キーを再生し、ブラウザの中で音の高さを変えている)ので、
+    返事は変換を待たずに返す。ここで作った WAV は「ダウンロード」を押したときの MP3 の材料になる。
+    - 最後に選ばれたキーの分だけ作る。別のキーが選ばれたら、作りかけはその場でやめる。
+    - 利用者が待っている変換とは数えない(`ensure_render` の prepare)。「ダウンロード」を押すと、
+      押した側(利用者が待っている MP3 作り)が、同じキーのこの変換が済むのを待って使う。
+    - 済んだら、まだそのキーが選ばれていれば、保存用の MP3 を前もって作る予定に入れる(`schedule_mp3`)。
+    原曲キーの MP3 は音源から直接作るので、変換は要らない(作りかけをやめ、MP3 の予定だけ入れる)。
+    MP3 の予定は、選ばれたキーの入れ替えと同じロックの中で入れる(行き違いで古いキーの MP3 を
+    作り始めないように)。
+    """
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._wanted: tuple[str, int] | None = None   # 最後に選ばれたキー
+        self._target: tuple[str, int] | None = None   # 次に作るもの
+        self._running: tuple[str, int] | None = None  # いま作っているもの
+        self._thread: threading.Thread | None = None
+        self._stopping = False
+
+    def schedule(self, source_id: str, semitones: int) -> None:
+        target = (source_id, semitones)
+        with self._cv:
+            self._stopping = False
+            self._wanted = target
+            mp3_maker.keep_only(source_id, semitones)
+            if semitones == 0:
+                self._target = None
+                schedule_mp3(source_id, 0)
+            else:
+                self._target = None if self._running == target else target
+            if self._target is not None and (self._thread is None or not self._thread.is_alive()):
+                self._thread = threading.Thread(target=self._run, name="prepare", daemon=True)
+                self._thread.start()
+            self._cv.notify_all()
+        with _render_guard:  # 前に選ばれていたキーの作りかけはやめる
+            for r in _renders:
+                if r.prepare and (r.source_id, r.semitones) != target:
+                    r.cancel.set()
+
+    def stop(self) -> None:
+        with self._cv:
+            self._target = self._wanted = None
+            self._stopping = True
+            self._cv.notify_all()
+        with _render_guard:
+            for r in _renders:
+                if r.prepare:
+                    r.cancel.set()
+
+    def wait_idle(self, timeout: float = 60) -> bool:
+        """作る分がすべて終わるまで待つ(テスト用)。"""
+        with self._cv:
+            return self._cv.wait_for(lambda: self._target is None and self._running is None, timeout)
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while self._target is None and not self._stopping:
+                    self._cv.wait()
+                if self._stopping:
+                    return
+                target, self._target = self._target, None
+                self._running = target
+            try:
+                ensure_render(*target, prepare=True, wanted=lambda: self._wanted == target)
+                with self._cv:
+                    if self._wanted == target:
+                        schedule_mp3(*target)
+            except Exception:  # noqa: BLE001  (作れなくても、ダウンロードのときに作り直すだけ)
+                pass
+            finally:
+                with self._cv:
+                    self._running = None
+                    self._cv.notify_all()
+
+
+preparer = Preparer()
+
+
 def safe_filename(title: str, semitones: int, ext: str = ".mp3") -> str:
     t = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]', "_", title or "audio").strip(" .")
     t = re.sub(r"\s+", " ", t)[:80].strip(" .") or "audio"
@@ -1097,6 +1200,7 @@ async def _lifespan(_app):
     # 終了時: 動いている変換(ffmpeg)を止め、作業ファイルを片付け終わるのを少し待つ
     prefetcher.stop()
     mp3_maker.stop()
+    preparer.stop()
     cancel_all_renders()
     with _render_guard:
         _render_guard.wait_for(lambda: not _renders and not _encodes, timeout=5)
@@ -1146,6 +1250,9 @@ class RenderRequest(BaseModel):
     semitones: int
     compat: bool = False  # 音源をそのままでは再生できなかったので、WAV に直したものを使う
     peek: bool = False    # すぐ再生できるときだけ応える(変換は始めない)
+    # 画面がリアルタイムでキーを変えて再生している(原曲キーだけを再生する)。このキーは保存用に
+    # 裏で用意するだけで、返事は変換を待たない。近くのキーの先回り変換もしない
+    live: bool = False
 
 
 class Mp3Request(BaseModel):
@@ -1212,6 +1319,8 @@ def api_render(req: RenderRequest):
     """このキーの音声を再生できるようにして、その URL を返す。"""
     check_id(req.id)
     _check_key(req.semitones)
+    if req.live:
+        return _prepare_live(req.id, req.semitones)
     if req.peek and not is_ready(req.id, req.semitones, req.compat):
         if not source_path(req.id):
             raise UserError("音声が見つかりません(キャッシュが削除された可能性があります)。もう一度読み込んでください。", 404)
@@ -1226,6 +1335,23 @@ def api_render(req: RenderRequest):
             "download_url": _audio_url(req.id, req.semitones, download=True),
             "filename": safe_filename(meta.get("title", "audio"), req.semitones),
             "mp3": mp3_path(req.id, req.semitones).exists()}
+
+
+def _prepare_live(source_id: str, semitones: int) -> dict:
+    """リアルタイム再生の画面から: 選ばれたキーを保存用に用意し始め、ダウンロード用の情報をすぐ返す。
+
+    聴いているのは原曲キー(`/api/audio/<ID>?semitones=0`)なので、近くのキーの先回り変換は
+    要らない(この音源の分はやめる)。この返事が再生に使われることはない。
+    """
+    if not source_path(source_id):
+        raise UserError("音声が見つかりません(キャッシュが削除された可能性があります)。もう一度読み込んでください。", 404)
+    prefetcher.drop(source_id)
+    preparer.schedule(source_id, semitones)
+    meta = read_meta(source_id) or {}
+    return {"live": True,
+            "download_url": _audio_url(source_id, semitones, download=True),
+            "filename": safe_filename(meta.get("title", "audio"), semitones),
+            "mp3": mp3_path(source_id, semitones).exists()}
 
 
 @app.post("/api/mp3")
