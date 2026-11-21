@@ -28,6 +28,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod._Extractor, "warm", lambda self: None)
     with TestClient(appmod.app, base_url="http://127.0.0.1:8000") as c:
         yield c
+    assert appmod.preparer.wait_idle(10)
     assert appmod.mp3_maker.wait_idle(10)
 
 
@@ -51,6 +52,15 @@ def test_index_served(client):
     assert r.status_code == 200
     assert "キー変更アプリ" in r.text
     assert client.get("/app.js").status_code == 200
+
+
+def test_pitch_shifter_script_served(client):
+    """リアルタイムのキー変更に使う AudioWorklet のプログラムも配る(JavaScript として)。"""
+    r = client.get("/pv-shifter.js")
+    assert r.status_code == 200
+    assert "javascript" in r.headers["content-type"]
+    assert "registerProcessor('key-shift'" in r.text
+    assert 'addModule("pv-shifter.js")' in client.get("/app.js").text
 
 
 def test_status(client):
@@ -1338,3 +1348,130 @@ def test_prefetch_resumes_after_yielding(client, fake_prefetch):
     fake.release.set()
     assert appmod.prefetcher.wait_idle(10)
     assert rendered_keys(sid) == [-1, 0, 1, 7]
+
+
+# ---------------------------------------------------------------- リアルタイム再生の画面から(live)
+@pytest.fixture()
+def live(client, tone_dir, monkeypatch):
+    """先回り変換・MP3 の前もっての作成を記録だけするようにし、変換は release まで終わらないようにする。"""
+    monkeypatch.setattr(appmod.settings, "prefetch", 2)
+    seen = []
+    monkeypatch.setattr(appmod.prefetcher, "schedule", lambda source_id, keys: seen.append(("prefetch", keys)))
+    monkeypatch.setattr(appmod.mp3_maker, "schedule", lambda source_id, semitones: seen.append(("mp3", semitones)))
+    sid = upload_tone(client, tone_dir)
+    fake = FakeRender()
+    monkeypatch.setattr(appmod.audio, "render", fake)
+    yield sid, fake, seen
+    fake.release.set()
+
+
+def test_live_answers_at_once_and_prepares_the_key_in_the_background(client, live):
+    """live は「画面が原曲キーを再生し、ブラウザの中で音の高さを変えている」という知らせ。
+    返事は変換を待たず(聴くのには使わない)、選ばれたキーは保存用に裏で変換する。近くの先回りはしない。"""
+    sid, fake, seen = live
+    body = render(client, sid, 3, live=True)               # 変換はまだ終わっていない
+    assert body == {"live": True, "download_url": f"/api/audio/{sid}?semitones=3&download=1",
+                    "filename": "tone440 (+3).mp3", "mp3": False}
+    fake.wait_started(3)
+    assert appmod._foreground == 0                         # 誰も待っていない変換として扱う
+    assert [r.prepare for r in appmod._renders] == [True]
+    assert seen == []
+    fake.release.set()
+    assert appmod.preparer.wait_idle(10)
+    assert rendered_keys(sid) == [3]                       # 選ばれたキーだけ(原曲キーも作らない)
+    assert seen == [("mp3", 3)]                            # 済んだら、保存用の MP3 を前もって作る予定に入れる
+
+
+def test_live_original_key_needs_no_render(client, live):
+    sid, fake, seen = live
+    body = render(client, sid, 0, live=True)
+    assert body["download_url"] == f"/api/audio/{sid}?semitones=0&download=1"
+    assert appmod.preparer.wait_idle(10)
+    assert rendered_keys(sid) == [] and fake.started == {}  # 原曲キーの MP3 は音源から直接作る
+    assert seen == [("mp3", 0)]
+
+
+def test_live_latest_key_wins(client, live):
+    """スライダーを動かしている間に次々に頼まれても、最後に選ばれたキーの分だけ作る。"""
+    sid, fake, seen = live
+    render(client, sid, 5, live=True)
+    fake.wait_started(5)
+    render(client, sid, 6, live=True)                      # +5 の作りかけはやめる
+    render(client, sid, 7, live=True)                      # +6 は始まる前に +7 に置き換わる(か、すぐやめる)
+    fake.wait_started(7)
+    fake.release.set()
+    assert appmod.preparer.wait_idle(10)
+    assert rendered_keys(sid) == [7]
+    assert seen == [("mp3", 7)]
+    assert appmod._renders == [] and appmod._foreground == 0
+
+
+def test_live_back_to_the_original_key_stops_the_render(client, live):
+    sid, fake, seen = live
+    render(client, sid, 4, live=True)
+    fake.wait_started(4)
+    render(client, sid, 0, live=True)
+    assert appmod.preparer.wait_idle(10)
+    assert rendered_keys(sid) == [] and seen == [("mp3", 0)]
+
+
+def test_live_does_not_stop_the_original_key_the_page_is_playing(client, live):
+    """MP3 などは原曲キーも WAV に直して再生する。その変換(プレーヤーが待っている)は、
+    保存用の準備では取り消さない。"""
+    sid, fake, seen = live
+    play = run_async(client.get, f"/api/audio/{sid}?semitones=0")
+    fake.wait_started(0)
+    render(client, sid, 2, live=True)
+    fake.wait_started(2)
+    time.sleep(0.1)
+    assert play["thread"].is_alive() and "error" not in play
+    fake.release.set()
+    assert finish(play)["result"].status_code == 200
+    assert appmod.preparer.wait_idle(10)
+    assert rendered_keys(sid) == [0, 2]
+
+
+def test_live_download_right_away_waits_for_the_same_render(client, live, monkeypatch):
+    """準備中に「ダウンロード」を押すと、利用者が待っている MP3 作りとして、同じキーの変換が済むのを待って使う
+    (作り直さない・取り消さない)。待っている間は先回り変換を止める。"""
+    sid, fake, seen = live
+    monkeypatch.setattr(appmod.audio, "encode_mp3", lambda src, dst, **kw: dst.write_bytes(b"mp3"))
+    render(client, sid, 4, live=True)
+    fake.wait_started(4)
+    save = run_async(client.post, "/api/mp3", json={"id": sid, "semitones": 4})
+    end = time.time() + 5
+    while appmod._foreground == 0 and time.time() < end:
+        time.sleep(0.01)
+    time.sleep(0.1)
+    try:
+        assert appmod._foreground > 0                      # 先回り変換はこの間は動かない
+        assert save["thread"].is_alive()
+        assert [(r.semitones, r.prepare, r.cancel.is_set()) for r in appmod._renders] == [
+            (4, True, False), (4, False, False)]           # 準備中の変換は取り消さず、それが済むのを待つ
+    finally:
+        fake.release.set()
+    assert finish(save)["result"].status_code == 200
+    assert appmod.preparer.wait_idle(10)
+    assert appmod.mp3_path(sid, 4).exists() and rendered_keys(sid) == [4]
+    assert appmod._renders == [] and appmod._foreground == 0
+    assert render(client, sid, 4, live=True)["mp3"] is True
+
+
+def test_live_drops_the_prefetch_of_that_source(client, fake_prefetch):
+    """以前の方式で聴いていて先回り変換が動いていても、live が来たらこの音源の分はやめる。"""
+    fake, sid = fake_prefetch
+    assert client.post("/api/render", json={"id": sid, "semitones": 0}).status_code == 200
+    fake.wait_started(1)                                   # +1 を先回り中(まだ終わらない)
+    render(client, sid, 5, live=True)
+    assert appmod.prefetcher.wait_idle(10)
+    assert appmod.preparer.wait_idle(10)
+    assert rendered_keys(sid) == [0, 5]                    # +1・−1 の先回りはやめ、+4・+6 も頼まない
+
+
+def test_live_errors(client, live):
+    sid, fake, seen = live
+    r = client.post("/api/render", json={"id": "0" * 20, "semitones": 1, "live": True})
+    assert r.status_code == 404
+    assert client.post("/api/render", json={"id": sid, "semitones": 13, "live": True}).status_code == 400
+    assert client.post("/api/render", json={"id": "zz", "semitones": 1, "live": True}).status_code == 400
+    assert appmod.preparer.wait_idle(10) and fake.started == {}

@@ -7,7 +7,7 @@
     envWarning: $("env-warning"), card: $("player-card"), title: $("title"), duration: $("duration"),
     slider: $("slider"), minus: $("minus"), plus: $("plus"), reset: $("reset"),
     keyValue: $("key-value"), keyLabel: $("key-label"), rendering: $("rendering"),
-    player: $("player"), download: $("download"), engineNote: $("engine-note"),
+    player: $("player"), download: $("download"), engineNote: $("engine-note"), liveNote: $("live-note"),
   };
   // seq:      キーを変える・曲を読み込むたびに増える番号(古い操作への返事を見分ける)
   // applied:  プレーヤーに反映し終えた操作の番号
@@ -15,13 +15,144 @@
   // shown:    プレーヤーに今読み込まれている音声 { id, n, direct }(direct = 音源そのものを再生している)
   // compat:   音源そのものをこのブラウザで再生できなかった音源の ID(変換したものを使う)
   // resume:   キーを切り替えたあとに戻す再生位置 { pos, playing }(読み込みが済んだら戻して消す)
+  //           (以前の方式のとき。リアルタイムのときは、原曲キーの音源を読み込み直したときにも使う)
   // dl:       ダウンロードボタンの中身 { id, n, ready }(ready = MP3 がもう出来ている)
   const state = {
     id: null, title: "", semitones: 0, seq: 0, applied: 0, debounce: null, peekTimer: null, spinner: null,
-    busy: false, playerId: null, shown: null, compat: {}, resume: null, dl: null,
+    baseSpinner: null, busy: false, playerId: null, shown: null, compat: {}, resume: null, dl: null,
   };
 
   const MAKING_MP3 = "MP3 を作成中…";
+
+  // ---------------------------------------------------------------- リアルタイムのキー変更
+  // 使えるブラウザでは、プレーヤーには原曲キーの音声だけを読み込み、その音をブラウザの中で
+  // 音の高さを変えて(static/pv-shifter.js)鳴らす。キーを変えても音声を差し替えないので、
+  // 音は数十ミリ秒で切り替わり、再生も途切れない。
+  //   プレーヤー → MediaElementSource → AudioWorklet(key-shift)→ スピーカー
+  // 保存用の MP3 はこれまでどおりサーバーが作る(聴いている音とは別に、高音質で)。
+  // 使えないとき(AudioWorklet が無い・安全な接続(127.0.0.1 など)でない・読み込みに失敗した)は、
+  // 以前の方式(サーバーが変換した音声にプレーヤーの中身を差し替える)で動く。
+  // どちらにするかはページを開いたときに一度だけ決める。プレーヤーを一度 AudioContext につなぐと
+  // 元に戻せず、AudioContext が止まっている間は音が出ないため、つなぐのは利用者の操作のあとにする。
+  //
+  // mode:   "pending"(調べている)/ "live"(リアルタイム)/ "swap"(以前の方式)
+  // source: プレーヤーをつないだ MediaElementSource(まだつないでいなければ null)
+  const rt = { mode: "pending", ctx: null, node: null, semitones: null, source: null };
+  const LIVE_DELAY = 400; // キーを変えてから、保存用の準備をサーバーに頼むまでの待ち時間(ミリ秒)
+
+  function withTimeout(promise, ms) {
+    return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms))]);
+  }
+
+  async function detectLive() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC || !window.AudioWorkletNode || !window.isSecureContext) return "swap";
+    let ctx = null;
+    try {
+      ctx = new AC({ latencyHint: "interactive" }); // 利用者が操作するまでは止まったまま(音は出ない)
+      await withTimeout(ctx.audioWorklet.addModule("pv-shifter.js"), 5000);
+      const node = new AudioWorkletNode(ctx, "key-shift", {
+        numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+      });
+      ctx.createMediaElementSource(new Audio()); // つなげるかどうかを、プレーヤーとは別の要素で試す
+      rt.ctx = ctx;
+      rt.node = node;
+      rt.semitones = node.parameters.get("semitones");
+      return "live";
+    } catch (e) {
+      if (ctx) ctx.close().catch(() => {});
+      return "swap";
+    }
+  }
+
+  const modeReady = detectLive().then((mode) => {
+    rt.mode = mode;
+    if (mode !== "live") return;
+    els.liveNote.hidden = false;
+    rt.ctx.addEventListener("statechange", () => {
+      if (rt.ctx.state === "running") {
+        if (!rt.source && !els.player.paused) connectGraph();
+      } else if (rt.source && !els.player.paused) {
+        resumeAudio(); // 再生中に止められた(ほかのアプリが音を使ったときなど)
+      }
+    });
+  });
+
+  function resumeAudio() {
+    const ctx = rt.ctx;
+    if (!ctx || ctx.state === "running" || ctx.state === "closed") return Promise.resolve();
+    return ctx.resume().catch(() => {});
+  }
+
+  // プレーヤーを AudioContext につなぐ(一度だけ。以後、プレーヤーの音は必ずここを通る)
+  function connectGraph() {
+    if (rt.source) return;
+    try {
+      rt.source = rt.ctx.createMediaElementSource(els.player);
+    } catch (e) {
+      useSwap(); // つなげなかった。プレーヤーはそのままなので、以前の方式に切り替えれば聴ける
+      return;
+    }
+    rt.source.connect(rt.node);
+    rt.node.connect(rt.ctx.destination);
+  }
+
+  // キーの操作(ボタン・スライダー)から呼ぶ。利用者の操作の中なので、AudioContext を動かせる。
+  // 再生を始める前にキーを変えたときも、音が出る時にはもう変えたキーで鳴る
+  function engageFromGesture() {
+    if (rt.mode !== "live") return;
+    resumeAudio();
+    connectGraph();
+  }
+
+  function useSwap() {
+    rt.mode = "swap";
+    els.liveNote.hidden = true;
+    if (state.id) setKey(state.semitones, 0);
+  }
+
+  function setShift(n) {
+    if (rt.semitones) rt.semitones.value = n;
+  }
+
+  // 前の位置の音の残りを捨てる(シークしたとき・曲を入れ替えたとき)
+  function flushShift() {
+    if (rt.node) rt.node.port.postMessage({ type: "flush" });
+  }
+
+  function baseUrl(id) {
+    return "/api/audio/" + id + "?semitones=0" + (state.compat[id] ? "&compat=1" : "");
+  }
+
+  // リアルタイムのとき: プレーヤーには原曲キーの音声だけを読み込む。キーを変えても読み込み直さない
+  function loadBase(id, direct) {
+    const p = els.player;
+    state.resume = state.playerId === id ? { pos: p.currentTime || 0, playing: !p.paused && !p.ended } : null;
+    p.src = baseUrl(id);
+    state.playerId = id;
+    state.shown = { id: id, n: 0, direct: direct && !state.compat[id] };
+    flushShift();
+    p.load();
+    // そのままでは再生できない音源(MP3 など)は、WAV に直すのに少し時間がかかる
+    clearTimeout(state.baseSpinner);
+    state.baseSpinner = setTimeout(() => { if (p.readyState < 1 && !p.error) els.rendering.hidden = false; }, 150);
+  }
+
+  // リアルタイムのとき: 選ばれたキーを、保存用にサーバーに用意してもらう。聴く音には関係しない
+  async function prepareDownload(seq) {
+    if (!state.id || seq !== state.seq) return;
+    const id = state.id, n = state.semitones;
+    try {
+      const r = await api("/api/render", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: id, semitones: n, live: true }),
+      });
+      if (seq !== state.seq) return; // もっと新しい操作がある
+      enableDownload(r.download_url, r.filename, id, n, !!r.mp3);
+    } catch (e) {
+      if (seq === state.seq) showError(e.message);
+    }
+  }
 
   function disableDownload() {
     state.dl = null;
@@ -112,8 +243,10 @@
     } catch (e) { /* 無視 */ }
   }
 
-  function onLoaded(meta) {
-    if (state.playerId !== meta.id) resetPlayer();
+  async function onLoaded(meta) {
+    await modeReady; // リアルタイムで再生するかどうかが決まってから
+    const fresh = state.playerId !== meta.id;
+    if (fresh) resetPlayer();
     state.id = meta.id;
     state.title = meta.title;
     els.download.textContent = "ダウンロード (MP3)";
@@ -121,6 +254,8 @@
     els.duration.textContent = fmtDuration(meta.duration);
     els.card.hidden = false;
     setKey(0, 0);
+    // direct が null なら、音源は WAV に直して再生する(meta.json の古いものには無いので、そのときは試す)
+    if (rt.mode === "live" && fresh) loadBase(meta.id, meta.direct !== null);
     els.card.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -143,7 +278,7 @@
         // 終わるまで(最長 1 秒)サーバー側で待ってもらう。終わったらすぐ返事が来る
         const asked = Date.now();
         const j = await api("/api/jobs/" + job + "?wait=1");
-        if (j.status === "done") { onLoaded(j.result); break; }
+        if (j.status === "done") { await onLoaded(j.result); break; }
         if (j.status === "error") throw new Error(j.error || "ダウンロードに失敗しました。");
         if (j.progress != null) {
           setProgress(j.progress);
@@ -167,7 +302,7 @@
     fd.append("file", file);
     try {
       const meta = await api("/api/upload", { method: "POST", body: fd });
-      onLoaded(meta);
+      await onLoaded(meta);
     } catch (e) {
       showError(e.message);
     } finally {
@@ -179,6 +314,8 @@
   // delay:     変換を頼むまでの待ち時間(ミリ秒)。続けて操作している間は頼まない
   // peekDelay: 「もう変換済みなら、すぐ切り替える」ための問い合わせを出すまでの待ち時間。
   //            近くのキーは先回りで変換済みのことが多いので、変換を頼むより先に聞いてみる
+  // リアルタイムのときは、音の高さはその場で変え、delay は保存用の準備を頼むまでの待ち時間にだけ使う
+  // (0 ならすぐ、それ以外は LIVE_DELAY。スライダーを動かしている間は頼まない)
   function setKey(n, delay, peekDelay) {
     n = Math.max(-12, Math.min(12, Math.round(n)));
     state.semitones = n;
@@ -192,6 +329,11 @@
     clearTimeout(state.debounce);
     clearTimeout(state.peekTimer);
     clearTimeout(state.spinner);
+    if (rt.mode === "live") {
+      setShift(n);
+      state.debounce = setTimeout(() => prepareDownload(seq), delay === 0 ? 0 : LIVE_DELAY);
+      return;
+    }
     if (delay === undefined) delay = 450;
     // 変換済みのキーに切り替えるだけのときに「変換中」が一瞬ちらつかないよう、少し遅らせて出す
     state.spinner = setTimeout(() => { els.rendering.hidden = false; }, 150);
@@ -264,11 +406,11 @@
   els.form.addEventListener("submit", (e) => { e.preventDefault(); if (!state.busy) loadUrl(els.url.value); });
   els.file.addEventListener("change", () => { const f = els.file.files && els.file.files[0]; if (f) uploadFile(f); });
   // スライダーは動かしている途中の値も届くので、少し止まってから問い合わせる
-  els.slider.addEventListener("input", () => setKey(parseInt(els.slider.value, 10), 450, 120));
+  els.slider.addEventListener("input", () => { engageFromGesture(); setKey(parseInt(els.slider.value, 10), 450, 120); });
   // ボタンは 1 つずつ動かすので短めに待つ(変換済みなら待たずに切り替わる)
-  els.minus.addEventListener("click", () => setKey(state.semitones - 1, 200));
-  els.plus.addEventListener("click", () => setKey(state.semitones + 1, 200));
-  els.reset.addEventListener("click", () => setKey(0, 200));
+  els.minus.addEventListener("click", () => { engageFromGesture(); setKey(state.semitones - 1, 200); });
+  els.plus.addEventListener("click", () => { engageFromGesture(); setKey(state.semitones + 1, 200); });
+  els.reset.addEventListener("click", () => { engageFromGesture(); setKey(0, 200); });
   els.download.addEventListener("click", (e) => {
     // 準備中のダウンロードボタンはクリック・Enter でも反応させない
     if (els.download.getAttribute("aria-disabled") === "true" || !state.dl) { e.preventDefault(); return; }
@@ -276,7 +418,17 @@
     e.preventDefault();
     download();
   });
+  els.player.addEventListener("play", () => {
+    if (rt.mode !== "live") return;
+    // 再生ボタンから。AudioContext が動き出してからつなぐ(動かせないうちにつなぐと音が出なくなる。
+    // まだつないでいないなら原曲キーのはずなので、そのまま鳴らしておけばよい)
+    resumeAudio().then(() => {
+      if (rt.mode === "live" && rt.ctx.state === "running" && !els.player.paused) connectGraph();
+    });
+  });
+  els.player.addEventListener("seeking", flushShift);
   els.player.addEventListener("loadedmetadata", () => {
+    if (rt.mode === "live") { clearTimeout(state.baseSpinner); els.rendering.hidden = true; }
     const r = state.resume;
     state.resume = null;
     if (!r) return;
@@ -286,10 +438,12 @@
   els.player.addEventListener("error", () => {
     if (!els.player.getAttribute("src")) return;
     const s = state.shown;
+    if (rt.mode === "live") { clearTimeout(state.baseSpinner); els.rendering.hidden = true; }
     if (s && s.direct && !state.compat[s.id]) {
       // 音源そのものを、このブラウザでは再生できなかった。変換したもの(WAV)に切り替える
       state.compat[s.id] = true;
-      if (s.id === state.id && s.n === state.semitones) setKey(s.n, 0);
+      if (rt.mode === "live") { if (s.id === state.id) loadBase(s.id, false); }
+      else if (s.id === state.id && s.n === state.semitones) setKey(s.n, 0);
       return;
     }
     showError("音声を再生できませんでした。もう一度お試しください。");
